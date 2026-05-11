@@ -99,7 +99,22 @@ int           prev_rightSpeed = 9999;
 
 // Periodic status
 unsigned long lastStatusPrint = 0;
-#define STATUS_INTERVAL_MS 2000
+
+// -- Pi serial bridge (Serial2) ------------------------------
+// ESP32 TX2=GPIO17 -> Pi GPIO15(RX)  |  ESP32 RX2=GPIO16 -> Pi GPIO14(TX)
+#define PI_SERIAL_TX    17
+#define PI_SERIAL_RX    16
+#define PI_BAUD         115200
+#define PI_TELEM_MS     50     // send telemetry to Pi every 50ms (~20Hz)
+#define PI_CMD_TIMEOUT  500    // ms without Pi command before ignoring Pi drive
+
+// Pi bridge state
+unsigned long lastTelemSent   = 0;
+unsigned long lastPiCmd       = 0;    // millis of last valid Pi drive command
+bool          piDriveActive   = false; // true when Pi is sending drive commands
+int           pi_leftSpeed    = 0;
+int           pi_rightSpeed   = 0;
+String        piCmdBuffer     = "";   // incoming serial line buffer
 
 // -- Debug helpers -------------------------------------------
 
@@ -354,6 +369,87 @@ int calcDpadSpeed(int rawL2) {
   return (int)map(rawL2, 0, 1023, DPAD_SPEED_MIN, MAX_SPEED);
 }
 
+
+// -- Pi serial bridge functions ------------------------------
+
+// Send JSON telemetry to Pi over Serial2
+// Format: {"enc_l":0,"enc_r":0,"relay_arm":0,"relay_motor":0,"relay_turbo":0,"connected":1,"mode":"DUAL","batt":0}
+void sendTelemetry() {
+  Serial2.print(F("{\"enc_l\":0,\"enc_r\":0"));   // placeholder until encoders wired
+  Serial2.print(F(",\"relay_arm\":"));   Serial2.print(digitalRead(RELAY_ARM));
+  Serial2.print(F(",\"relay_motor\":")); Serial2.print(relay_motor  ? 1 : 0);
+  Serial2.print(F(",\"relay_turbo\":")); Serial2.print(relay_turbo  ? 1 : 0);
+  Serial2.print(F(",\"connected\":"));   Serial2.print(gGamepad ? 1 : 0);
+  Serial2.print(F(",\"mode\":\""));
+  Serial2.print(tankMode == MODE_DUAL_STICK ? F("DUAL") : F("SINGLE"));
+  Serial2.print(F("\""));
+  Serial2.print(F(",\"batt\":"));
+  Serial2.print(gGamepad ? gGamepad->battery() : 0);
+  Serial2.println(F("}"));
+}
+
+// Parse a JSON command from Pi
+// Supported: {"cmd":"drive","l":100,"r":100}
+//            {"cmd":"stop"}
+//            {"cmd":"relay","id":"motor","state":1}
+//            {"cmd":"ping"}
+void parsePiCommand(String line) {
+  line.trim();
+  if (line.length() < 5) return;
+
+  Serial.print(F("[PI   ] Rx: ")); Serial.println(line);
+
+  if (line.indexOf("\"cmd\":\"ping\"") >= 0) {
+    Serial2.println(F("{\"pong\":1}"));
+    Serial.println(F("[PI   ] Pong sent"));
+    return;
+  }
+
+  if (line.indexOf("\"cmd\":\"stop\"") >= 0) {
+    pi_leftSpeed   = 0;
+    pi_rightSpeed  = 0;
+    piDriveActive  = false;
+    Serial.println(F("[PI   ] Stop command"));
+    return;
+  }
+
+  if (line.indexOf("\"cmd\":\"drive\"") >= 0) {
+    // Extract l and r values
+    int lIdx = line.indexOf("\"l\":") + 4;
+    int rIdx = line.indexOf("\"r\":") + 4;
+    if (lIdx > 4 && rIdx > 4) {
+      pi_leftSpeed  = constrain(line.substring(lIdx).toInt(), -MAX_SPEED, MAX_SPEED);
+      pi_rightSpeed = constrain(line.substring(rIdx).toInt(), -MAX_SPEED, MAX_SPEED);
+      piDriveActive = true;
+      lastPiCmd     = millis();
+      Serial.print(F("[PI   ] Drive L=")); Serial.print(pi_leftSpeed);
+      Serial.print(F(" R="));             Serial.println(pi_rightSpeed);
+    }
+    return;
+  }
+
+  if (line.indexOf("\"cmd\":\"relay\"") >= 0) {
+    int stateIdx = line.indexOf("\"state\":") + 8;
+    bool state   = line.substring(stateIdx).toInt() == 1;
+    if (line.indexOf("\"id\":\"motor\"") >= 0) {
+      if (state && !relay_motor && armState == ARM_IDLE) {
+        startArmSequence();
+        Serial.println(F("[PI   ] Relay motor ON via Pi"));
+      } else if (!state && relay_motor) {
+        stopMotor();
+        Serial.println(F("[PI   ] Relay motor OFF via Pi"));
+      }
+    } else if (line.indexOf("\"id\":\"turbo\"") >= 0) {
+      relay_turbo = state;
+      digitalWrite(RELAY_TURBO, relay_turbo ? HIGH : LOW);
+      Serial.print(F("[PI   ] Relay turbo ")); Serial.println(state ? F("ON") : F("OFF"));
+    }
+    return;
+  }
+
+  Serial.print(F("[PI   ] Unknown command: ")); Serial.println(line);
+}
+
 // -- Setup ---------------------------------------------------
 
 void setup() {
@@ -383,6 +479,12 @@ void setup() {
   Serial.print(F("       TURBO relay pin=")); Serial.println(RELAY_TURBO);
 
   Serial.println(F("[INIT] Starting Bluepad32..."));
+
+  Serial.println(F("[INIT] Starting Pi serial bridge (Serial2)..."));
+  Serial2.begin(PI_BAUD, SERIAL_8N1, PI_SERIAL_RX, PI_SERIAL_TX);
+  Serial.print(F("       TX2=GPIO")); Serial.print(PI_SERIAL_TX);
+  Serial.print(F(" RX2=GPIO"));       Serial.println(PI_SERIAL_RX);
+
   BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
   // BP32.forgetBluetoothKeys();  // uncomment to force fresh pair on boot
 
@@ -402,7 +504,32 @@ void loop() {
   // 1. Arm state machine (non-blocking, runs every iteration)
   updateArmStateMachine();
 
-  // 2. Timed rumble off
+  // 2. Pi serial bridge — read incoming commands
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '\n') {
+      parsePiCommand(piCmdBuffer);
+      piCmdBuffer = "";
+    } else {
+      if (piCmdBuffer.length() < 200) piCmdBuffer += c;
+    }
+  }
+
+  // 3. Pi drive timeout — if no command for PI_CMD_TIMEOUT ms, stop Pi drive
+  if (piDriveActive && (millis() - lastPiCmd > PI_CMD_TIMEOUT)) {
+    piDriveActive = false;
+    pi_leftSpeed  = 0;
+    pi_rightSpeed = 0;
+    Serial.println(F("[PI   ] Drive timeout -- Pi drive stopped"));
+  }
+
+  // 4. Send telemetry to Pi at PI_TELEM_MS interval
+  if (millis() - lastTelemSent >= PI_TELEM_MS) {
+    lastTelemSent = millis();
+    sendTelemetry();
+  }
+
+  // 5. Timed rumble off
   if (rumbleOffTime && millis() >= rumbleOffTime) {
     rumbleOffTime = 0;
     if (gGamepad && gGamepad->isConnected()) {
@@ -411,6 +538,7 @@ void loop() {
     }
   }
 
+  // 6. Bluepad32 update
   bool updated = BP32.update();
 
   if (gGamepad == nullptr || !gGamepad->isConnected()) {
@@ -573,6 +701,12 @@ void loop() {
         }
       }
     }
+  }
+
+  // Pi drive overrides RC when active
+  if (piDriveActive) {
+    leftSpeed  = pi_leftSpeed;
+    rightSpeed = pi_rightSpeed;
   }
 
   driveMotor(MOTOR_A_PWM, MOTOR_A_DIR, leftSpeed);
