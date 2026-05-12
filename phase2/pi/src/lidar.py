@@ -146,13 +146,17 @@ class LidarX2:
         """Background thread — reads serial and parses packets into scans."""
         logger.info("[LIDAR] Reader loop running")
         buf = bytearray()
-        partial_scan = []   # accumulate packets until we wrap 360
+        partial_scan = []
 
-        last_end_angle = None
+        # Scan emit strategy: use zero-packet flag (bit0 of type byte)
+        # Zero packet = start of new revolution on X2
+        # Fallback: emit every 150ms if we have enough points
+        last_emit_time = time.time()
+        EMIT_INTERVAL  = 0.15   # seconds — one revolution at ~7Hz
 
         while not self._stop_event.is_set():
             try:
-                data = self._ser.read(256)
+                data = self._ser.read(128)
                 if not data:
                     continue
                 buf.extend(data)
@@ -181,29 +185,15 @@ class LidarX2:
 
                     pkt_len = 10 + num_points * 2
                     if len(buf) < pkt_len:
-                        break   # wait for more data
+                        break
+
+                    # Type byte bit 0 = zero/start packet (new revolution)
+                    pkt_type   = buf[2]
+                    is_zero    = bool(pkt_type & 0x01)
 
                     # Decode angles
-                    start_ang = (((buf[5] << 8) | buf[4]) >> 1) / 64.0
-                    end_ang   = (((buf[7] << 8) | buf[6]) >> 1) / 64.0
-
-                    # Wrap angles to 0-360
-                    start_ang = start_ang % 360.0
-                    end_ang   = end_ang   % 360.0
-
-                    # Detect scan wrap (new revolution started)
-                    if last_end_angle is not None:
-                        if start_ang < last_end_angle - 10:
-                            # Wrapped around — emit completed scan
-                            if len(partial_scan) > 10:
-                                with self._lock:
-                                    self._scan = sorted(partial_scan, key=lambda x: x[0])
-                                    self._scan_count += 1
-                                    self._last_scan = time.time()
-                                logger.debug(f"[LIDAR] Scan {self._scan_count}: {len(partial_scan)} pts")
-                            partial_scan = []
-
-                    last_end_angle = end_ang
+                    start_ang = (((buf[5] << 8) | buf[4]) >> 1) / 64.0 % 360.0
+                    end_ang   = (((buf[7] << 8) | buf[6]) >> 1) / 64.0 % 360.0
 
                     # Decode points
                     if num_points > 1:
@@ -223,6 +213,18 @@ class LidarX2:
 
                     self._packets_parsed += 1
                     buf = buf[pkt_len:]
+
+                    # Emit scan on zero packet OR time window
+                    now = time.time()
+                    elapsed = now - last_emit_time
+                    if (is_zero or elapsed >= EMIT_INTERVAL) and len(partial_scan) >= 100:
+                        with self._lock:
+                            self._scan = sorted(partial_scan, key=lambda x: x[0])
+                            self._scan_count += 1
+                            self._last_scan = now
+                        logger.debug(f"[LIDAR] Scan {self._scan_count}: {len(partial_scan)} pts zero={is_zero}")
+                        partial_scan = []
+                        last_emit_time = now
 
             except serial.SerialException as e:
                 logger.error(f"[LIDAR] Serial error: {e}")
