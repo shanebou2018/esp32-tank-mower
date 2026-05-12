@@ -178,7 +178,7 @@ class ESP32Bridge:
         """Serialize obj to JSON and write to serial. Thread-safe."""
         if not self._ser or not self._ser.is_open:
             return
-        line = json.dumps(obj) + "\n"
+        line = json.dumps(obj, separators=(",", ":")) + "\n"
         try:
             with self._lock:
                 self._ser.write(line.encode("utf-8"))
