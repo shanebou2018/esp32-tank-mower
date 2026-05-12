@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'sensors'))
 
 from flask import Flask, jsonify, render_template_string
 from serial_bridge import ESP32Bridge
-from lidar import LidarX2
+from lidar import LidarX4
+from compass import Compass
 import logging
 import math
 
@@ -22,7 +23,8 @@ logging.basicConfig(level=logging.INFO,
 
 app = Flask(__name__)
 bridge = ESP32Bridge()
-lidar  = LidarX2()
+lidar   = LidarX4()
+compass = Compass()
 
 HTML = """
 <!DOCTYPE html>
@@ -358,7 +360,7 @@ def api_lidar():
         "closest_dist":   closest[1],
         "front_dist":     front,
         "scan_count":     stats["scan_count"],
-        "packets_parsed": stats["packets_parsed"],
+        "packets_parsed": stats.get("packets_parsed", stats.get("scan_count", 0)),
     })
 
 @app.route("/api/relay/<relay_id>/<int:state>", methods=["POST"])
