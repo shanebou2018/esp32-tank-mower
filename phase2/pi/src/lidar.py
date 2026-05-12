@@ -195,12 +195,15 @@ class LidarX2:
                     start_ang = (((buf[5] << 8) | buf[4]) >> 1) / 64.0 % 360.0
                     end_ang   = (((buf[7] << 8) | buf[6]) >> 1) / 64.0 % 360.0
 
-                    # Decode points
+                    # Decode points with official angle correction formula
+                    # First level: linear interpolation between FSA and LSA
+                    # Second level: AngCorrect = atan(21.8*(155.3-D)/(155.3*D))
                     if num_points > 1:
                         if end_ang >= start_ang:
-                            step = (end_ang - start_ang) / (num_points - 1)
+                            diff_ang = end_ang - start_ang
                         else:
-                            step = (end_ang + 360.0 - start_ang) / (num_points - 1)
+                            diff_ang = end_ang + 360.0 - start_ang
+                        step = diff_ang / (num_points - 1)
                     else:
                         step = 0
 
@@ -208,7 +211,18 @@ class LidarX2:
                         offset   = 10 + i * 2
                         dist_raw = ((buf[offset+1] << 8) | buf[offset]) >> 2
                         dist_m   = dist_raw / 1000.0
-                        angle    = (start_ang + step * i) % 360.0
+
+                        # First level angle
+                        angle = (start_ang + step * i) % 360.0
+
+                        # Second level angle correction (official formula)
+                        if dist_m > 0.0:
+                            ang_correct = math.degrees(
+                                math.atan(21.8 * (155.3 - dist_m * 1000.0) /
+                                         (155.3 * dist_m * 1000.0))
+                            )
+                            angle = (angle + ang_correct) % 360.0
+
                         partial_scan.append((angle, dist_m))
 
                     self._packets_parsed += 1
