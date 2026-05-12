@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'sensors'))
 
 from flask import Flask, jsonify, render_template_string
 from serial_bridge import ESP32Bridge
-from lidar import LidarX4
+from lidar import LidarX2
 import logging
 import math
 
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO,
 
 app = Flask(__name__)
 bridge = ESP32Bridge()
-lidar  = LidarX4()
+lidar  = LidarX2()
 
 HTML = """
 <!DOCTYPE html>
@@ -109,6 +109,15 @@ HTML = """
       <div class="telem-row"><span class="telem-label">Closest</span><span class="telem-value" id="t-closest">--</span></div>
       <div class="telem-row"><span class="telem-label">Front (0+-20deg)</span><span class="telem-value" id="t-front">--</span></div>
       <div class="telem-row"><span class="telem-label">Scans</span><span class="telem-value" id="t-scans">--</span></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot" id="compass-dot"></span>Compass / IMU</h2>
+      <div class="telem-row"><span class="telem-label">Heading</span><span class="telem-value" id="t-heading">--</span></div>
+      <div class="telem-row"><span class="telem-label">Roll</span><span class="telem-value" id="t-roll">--</span></div>
+      <div class="telem-row"><span class="telem-label">Pitch</span><span class="telem-value" id="t-pitch">--</span></div>
+      <div class="telem-row"><span class="telem-label">Temperature</span><span class="telem-value" id="t-temp">--</span></div>
+      <div class="telem-row"><span class="telem-label">Calibration</span><span class="telem-value" id="t-cal">--</span></div>
     </div>
   </div>
 
@@ -272,6 +281,18 @@ HTML = """
     ctx.stroke();
   }
 
+  function updateCompass(c) {
+    const online = c.connected;
+    document.getElementById('compass-dot').className = 'dot ' + (online ? 'online' : '');
+    setVal('t-heading', c.heading !== undefined ? c.heading.toFixed(1) + 'deg' : '--');
+    setVal('t-roll',    c.roll    !== undefined ? c.roll.toFixed(1)    + 'deg' : '--');
+    setVal('t-pitch',   c.pitch   !== undefined ? c.pitch.toFixed(1)   + 'deg' : '--');
+    setVal('t-temp',    c.temp    !== undefined ? c.temp + 'C'         : '--');
+    const calStr = c.cal_sys !== undefined ?
+      'sys=' + c.cal_sys + ' gyro=' + c.cal_gyro + ' mag=' + c.cal_mag : '--';
+    setVal('t-cal', calStr, c.calibrated ? 'on' : 'warn');
+  }
+
   async function fetchState() {
     try {
       const r = await fetch('/api/state');
@@ -286,6 +307,13 @@ HTML = """
     } catch(e) {}
   }
 
+  async function fetchCompass() {
+    try {
+      const r = await fetch('/api/compass');
+      updateCompass(await r.json());
+    } catch(e) {}
+  }
+
   async function toggleRelay(id) {
     const current = id === 'motor' ? state.relay_motor : state.relay_turbo;
     const newState = current ? 0 : 1;
@@ -295,9 +323,10 @@ HTML = """
     } catch(e) { addLog('Error: ' + e, 'err'); }
   }
 
-  fetchState(); fetchLidar();
-  setInterval(fetchState, 500);
-  setInterval(fetchLidar, 200);
+  fetchState(); fetchLidar(); fetchCompass();
+  setInterval(fetchState,   500);
+  setInterval(fetchLidar,   200);
+  setInterval(fetchCompass, 200);
   setInterval(() => { document.getElementById('last-update').textContent = new Date().toLocaleTimeString(); }, 1000);
 </script>
 </body>
@@ -339,6 +368,10 @@ def api_relay(relay_id, state):
     bridge.set_relay(relay_id, bool(state))
     return jsonify({"ok": True, "relay": relay_id, "state": state})
 
+@app.route("/api/compass")
+def api_compass():
+    return jsonify(compass.get_all())
+
 if __name__ == "__main__":
     try:
         bridge.start()
@@ -350,6 +383,12 @@ if __name__ == "__main__":
         logging.info("LIDAR started on /dev/ttyUSB0")
     except Exception as e:
         logging.error(f"LIDAR failed: {e} -- continuing without it")
+
+    try:
+        compass.start()
+        logging.info("Compass started")
+    except Exception as e:
+        logging.error(f"Compass failed: {e} -- continuing without it")
 
     logging.info("Web UI at http://tankmower.local:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
