@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'sensors'))
 
 from flask import Flask, jsonify, render_template_string
 from serial_bridge import ESP32Bridge
-from lidar import LidarX2
+from lidar import LidarX4
 import logging
 import math
 
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO,
 
 app = Flask(__name__)
 bridge = ESP32Bridge()
-lidar  = LidarX2()
+lidar  = LidarX4()
 
 HTML = """
 <!DOCTYPE html>
