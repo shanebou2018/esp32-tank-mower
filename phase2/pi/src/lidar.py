@@ -42,6 +42,11 @@ class LidarX4:
         self._last_scan  = 0.0
         self._thread     = None
 
+        # Temporal averaging — accumulate scans over AVERAGE_WINDOW seconds
+        self.AVERAGE_WINDOW = 1.0   # seconds
+        self._scan_buffer   = []    # list of (timestamp, scan_dict)
+        self._averaged_scan = {}    # current averaged output
+
     # ── Public API ───────────────────────────────────────────
 
     def start(self):
@@ -69,11 +74,12 @@ class LidarX4:
 
     def get_scan(self) -> list:
         """
-        Return latest scan as list of (angle_deg, dist_m).
+        Return temporally averaged scan as list of (angle_deg, dist_m).
+        Averages all scans received in the last AVERAGE_WINDOW seconds.
         Filters out zero/invalid distances.
         """
         with self._lock:
-            return [(a, d) for a, d in self._scan.items()
+            return [(a, d) for a, d in self._averaged_scan.items()
                     if MIN_DIST_M <= d <= MAX_DIST_M]
 
     def get_scan_raw(self) -> dict:
@@ -122,12 +128,35 @@ class LidarX4:
                     raw = next(gen)  # dict {angle(int): distance(float, mm)}
                     # Convert mm to m
                     scan_m = {a: d / 1000.0 for a, d in raw.items()}
+                    now = time.time()
                     with self._lock:
                         self._scan       = scan_m
                         self._scan_count += 1
-                        self._last_scan  = time.time()
-                    logger.debug(f"[LIDAR] Scan {self._scan_count}: "
-                                 f"{sum(1 for v in scan_m.values() if v > 0)} valid pts")
+                        self._last_scan  = now
+
+                        # Add to buffer and drop old scans
+                        self._scan_buffer.append((now, scan_m))
+                        self._scan_buffer = [
+                            (t, s) for t, s in self._scan_buffer
+                            if now - t <= self.AVERAGE_WINDOW
+                        ]
+
+                        # Recompute averaged scan
+                        angle_sums   = {}
+                        angle_counts = {}
+                        for _, s in self._scan_buffer:
+                            for a, d in s.items():
+                                if MIN_DIST_M <= d <= MAX_DIST_M:
+                                    angle_sums[a]   = angle_sums.get(a, 0.0) + d
+                                    angle_counts[a] = angle_counts.get(a, 0) + 1
+                        self._averaged_scan = {
+                            a: angle_sums[a] / angle_counts[a]
+                            for a in angle_sums
+                        }
+
+                    valid = sum(1 for v in scan_m.values() if MIN_DIST_M <= v <= MAX_DIST_M)
+                    logger.debug(f"[LIDAR] Scan {self._scan_count}: {valid} valid pts "
+                                 f"buf={len(self._scan_buffer)}")
                 except StopIteration:
                     logger.warning("[LIDAR] Scan generator stopped")
                     break
