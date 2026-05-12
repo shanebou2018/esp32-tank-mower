@@ -1,14 +1,22 @@
 # ============================================================
 #  lidar.py
 #  Direct serial parser for YDLIDAR X2 / X2 Pro
-#  No SDK needed — reads raw packets from /dev/ttyUSB0
+#  Based on official EAI X2 Development Manual V1.1
 #
-#  Usage:
-#    from lidar import LidarX2
-#    lidar = LidarX2()
-#    lidar.start()
-#    scan = lidar.get_scan()   # list of (angle_deg, dist_m)
-#    lidar.stop()
+#  Packet structure (little-endian):
+#    PH(2B)  = 0xAA 0x55  packet header
+#    CT(1B)  = packet type (bit0=1 means start/zero packet)
+#    LSN(1B) = number of sample points
+#    FSA(2B) = start angle raw
+#    LSA(2B) = end angle raw
+#    CS(2B)  = checksum (XOR of all 16-bit words except CS)
+#    Si(2B)  = sample data x LSN (distance = Si >> 2, mm)
+#
+#  Angle decoding:
+#    AngleFSA = (FSA >> 1) / 64.0
+#    AngleLSA = (LSA >> 1) / 64.0
+#    Anglei   = diff(Angle)/(LSN-1) * (i-1) + AngleFSA
+#    AngCorrect = atan(21.8 * (155.3 - Di) / (155.3 * Di))  [Di in mm]
 # ============================================================
 
 import serial
@@ -19,19 +27,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-LIDAR_PORT     = "/dev/ttyUSB0"
-LIDAR_BAUD     = 115200
-HEADER_A       = 0xD6
-HEADER_B       = 0x2D
-MAX_DIST_M     = 8.0    # X2 max range
-MIN_DIST_M     = 0.1    # X2 min range
-INVALID_DIST   = 8.224  # X2 sends this for no-return points
+LIDAR_PORT    = "/dev/ttyUSB0"
+LIDAR_BAUD    = 115200
+HEADER_A      = 0xAA   # PH low byte
+HEADER_B      = 0x55   # PH high byte
+MAX_DIST_M    = 8.0
+MIN_DIST_M    = 0.1
 
 
 class LidarX2:
     """
     Continuous background reader for the YDLIDAR X2/X2 Pro.
-    Parses raw serial packets and assembles full 360 degree scans.
+    Uses official packet format with checksum validation.
     Thread safe — call get_scan() from any thread.
     """
 
@@ -42,35 +49,31 @@ class LidarX2:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Latest complete 360 scan — list of (angle_deg, dist_m)
         self._scan       = []
         self._scan_count = 0
         self._last_scan  = 0.0
 
-        # Stats
-        self._packets_parsed = 0
-        self._packets_error  = 0
+        self._packets_ok    = 0
+        self._packets_bad   = 0
+        self._packets_error = 0
 
         self._thread = None
 
     # ── Public API ───────────────────────────────────────────
 
     def start(self):
-        """Open serial port and start background reader thread."""
         try:
             self._ser = serial.Serial(self.port, self.baud, timeout=1.0)
             logger.info(f"[LIDAR] Serial open: {self.port} @ {self.baud}")
         except serial.SerialException as e:
             logger.error(f"[LIDAR] Failed to open {self.port}: {e}")
             raise
-
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
         logger.info("[LIDAR] Reader thread started")
 
     def stop(self):
-        """Stop the reader thread and close serial port."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=3)
@@ -79,80 +82,110 @@ class LidarX2:
             logger.info("[LIDAR] Serial closed")
 
     def get_scan(self) -> list:
-        """
-        Return a copy of the latest complete 360 scan.
-        Each entry is (angle_deg, dist_m).
-        Returns empty list if no scan yet.
-        """
         with self._lock:
             return list(self._scan)
 
-    def get_scan_polar(self) -> list:
-        """
-        Return scan as list of (angle_rad, dist_m) for plotting.
-        Filters out invalid and out-of-range points.
-        """
-        with self._lock:
-            return [
-                (math.radians(a), d)
-                for a, d in self._scan
-                if MIN_DIST_M <= d <= MAX_DIST_M and abs(d - INVALID_DIST) > 0.01
-            ]
-
     def get_closest(self) -> tuple:
-        """
-        Return (angle_deg, dist_m) of the closest valid obstacle.
-        Returns (0, 999) if no scan available.
-        """
         scan = self.get_scan()
         valid = [(a, d) for a, d in scan
-                 if MIN_DIST_M <= d <= MAX_DIST_M and abs(d - INVALID_DIST) > 0.01]
+                 if MIN_DIST_M <= d <= MAX_DIST_M]
         if not valid:
             return (0, 999)
         return min(valid, key=lambda x: x[1])
 
     def get_sector_min(self, angle_center: float, half_width: float) -> float:
-        """
-        Return minimum distance in a sector centered on angle_center
-        with +/- half_width degrees. Useful for obstacle avoidance.
-        Returns 999 if no valid readings in sector.
-        """
         scan = self.get_scan()
         dists = []
         for a, d in scan:
             diff = abs(a - angle_center)
             if diff > 180:
                 diff = 360 - diff
-            if diff <= half_width and MIN_DIST_M <= d <= MAX_DIST_M and abs(d - INVALID_DIST) > 0.01:
+            if diff <= half_width and MIN_DIST_M <= d <= MAX_DIST_M:
                 dists.append(d)
         return min(dists) if dists else 999
 
     def is_connected(self) -> bool:
-        """True if scan data arrived within the last 2 seconds."""
         return (time.time() - self._last_scan) < 2.0
 
     def get_stats(self) -> dict:
         return {
-            "scan_count":     self._scan_count,
-            "packets_parsed": self._packets_parsed,
-            "packets_error":  self._packets_error,
-            "last_scan":      self._last_scan,
-            "connected":      self.is_connected()
+            "scan_count":    self._scan_count,
+            "packets_ok":    self._packets_ok,
+            "packets_bad":   self._packets_bad,
+            "packets_error": self._packets_error,
+            "last_scan":     self._last_scan,
+            "connected":     self.is_connected()
         }
 
     # ── Private ──────────────────────────────────────────────
 
+    @staticmethod
+    def _checksum(buf, num_points):
+        """XOR all 16-bit words: PH, CT|LSN, FSA, LSA, all Si."""
+        ph      = (buf[1] << 8) | buf[0]
+        ct_lsn  = (buf[2]     ) | (buf[3] << 8)
+        fsa     = (buf[5] << 8) | buf[4]
+        lsa     = (buf[7] << 8) | buf[6]
+        cs = ph ^ ct_lsn ^ fsa ^ lsa
+        for i in range(num_points):
+            o = 10 + i * 2
+            cs ^= (buf[o+1] << 8) | buf[o]
+        return cs
+
+    @staticmethod
+    def _decode_angle(raw):
+        """First-level angle decode: (raw >> 1) / 64.0"""
+        return (raw >> 1) / 64.0
+
+    @staticmethod
+    def _angle_correct(dist_mm):
+        """Second-level angle correction per official formula."""
+        if dist_mm <= 0:
+            return 0.0
+        return math.degrees(math.atan(21.8 * (155.3 - dist_mm) / (155.3 * dist_mm)))
+
+    def _parse_packet(self, buf, num_points):
+        """Parse a validated packet. Returns list of (angle_deg, dist_m)."""
+        fsa = (buf[5] << 8) | buf[4]
+        lsa = (buf[7] << 8) | buf[6]
+
+        ang_fsa = self._decode_angle(fsa)
+        ang_lsa = self._decode_angle(lsa)
+
+        # Clockwise diff
+        if ang_lsa >= ang_fsa:
+            diff = ang_lsa - ang_fsa
+        else:
+            diff = ang_lsa + 360.0 - ang_fsa
+
+        points = []
+        for i in range(num_points):
+            o        = 10 + i * 2
+            si       = (buf[o+1] << 8) | buf[o]
+            dist_mm  = si >> 2
+            dist_m   = dist_mm / 1000.0
+
+            # First level angle
+            if num_points > 1:
+                angle = (diff / (num_points - 1)) * i + ang_fsa
+            else:
+                angle = ang_fsa
+
+            angle = angle % 360.0
+
+            # Second level correction
+            angle = (angle + self._angle_correct(dist_mm)) % 360.0
+
+            points.append((angle, dist_m))
+
+        return points
+
     def _reader_loop(self):
-        """Background thread — reads serial and parses packets into scans."""
         logger.info("[LIDAR] Reader loop running")
         buf = bytearray()
         partial_scan = []
-
-        # Scan emit strategy: use zero-packet flag (bit0 of type byte)
-        # Zero packet = start of new revolution on X2
-        # Fallback: emit every 150ms if we have enough points
-        last_emit_time = time.time()
-        EMIT_INTERVAL  = 0.15   # seconds — one revolution at ~7Hz
+        last_emit    = time.time()
+        EMIT_INTERVAL = 0.15   # ~7Hz scan rate
 
         while not self._stop_event.is_set():
             try:
@@ -161,9 +194,8 @@ class LidarX2:
                     continue
                 buf.extend(data)
 
-                # Parse all complete packets from buffer
                 while len(buf) >= 10:
-                    # Find header 0xD6 0x2D
+                    # Find header 0xAA 0x55
                     idx = -1
                     for i in range(len(buf) - 1):
                         if buf[i] == HEADER_A and buf[i+1] == HEADER_B:
@@ -187,58 +219,34 @@ class LidarX2:
                     if len(buf) < pkt_len:
                         break
 
-                    # Type byte bit 0 = zero/start packet (new revolution)
-                    pkt_type   = buf[2]
-                    is_zero    = bool(pkt_type & 0x01)
+                    # Validate checksum
+                    cs_stored = (buf[9] << 8) | buf[8]
+                    cs_calc   = self._checksum(buf, num_points)
 
-                    # Decode angles
-                    start_ang = (((buf[5] << 8) | buf[4]) >> 1) / 64.0 % 360.0
-                    end_ang   = (((buf[7] << 8) | buf[6]) >> 1) / 64.0 % 360.0
+                    if cs_calc != cs_stored:
+                        self._packets_bad += 1
+                        buf = buf[2:]   # skip past this header and try again
+                        continue
 
-                    # Decode points with official angle correction formula
-                    # First level: linear interpolation between FSA and LSA
-                    # Second level: AngCorrect = atan(21.8*(155.3-D)/(155.3*D))
-                    if num_points > 1:
-                        if end_ang >= start_ang:
-                            diff_ang = end_ang - start_ang
-                        else:
-                            diff_ang = end_ang + 360.0 - start_ang
-                        step = diff_ang / (num_points - 1)
-                    else:
-                        step = 0
+                    # Good packet
+                    self._packets_ok += 1
+                    ct       = buf[2]
+                    is_zero  = bool(ct & 0x01)
 
-                    for i in range(num_points):
-                        offset   = 10 + i * 2
-                        dist_raw = ((buf[offset+1] << 8) | buf[offset]) >> 2
-                        dist_m   = dist_raw / 1000.0
-
-                        # First level angle
-                        angle = (start_ang + step * i) % 360.0
-
-                        # Second level angle correction (official formula)
-                        if dist_m > 0.0:
-                            ang_correct = math.degrees(
-                                math.atan(21.8 * (155.3 - dist_m * 1000.0) /
-                                         (155.3 * dist_m * 1000.0))
-                            )
-                            angle = (angle + ang_correct) % 360.0
-
-                        partial_scan.append((angle, dist_m))
-
-                    self._packets_parsed += 1
+                    points = self._parse_packet(buf, num_points)
+                    partial_scan.extend(points)
                     buf = buf[pkt_len:]
 
-                    # Emit scan on zero packet OR time window
+                    # Emit scan on zero packet or time window
                     now = time.time()
-                    elapsed = now - last_emit_time
-                    if (is_zero or elapsed >= EMIT_INTERVAL) and len(partial_scan) >= 100:
+                    if (is_zero or (now - last_emit) >= EMIT_INTERVAL) and len(partial_scan) >= 100:
                         with self._lock:
                             self._scan = sorted(partial_scan, key=lambda x: x[0])
                             self._scan_count += 1
-                            self._last_scan = now
+                            self._last_scan  = now
                         logger.debug(f"[LIDAR] Scan {self._scan_count}: {len(partial_scan)} pts zero={is_zero}")
                         partial_scan = []
-                        last_emit_time = now
+                        last_emit    = now
 
             except serial.SerialException as e:
                 logger.error(f"[LIDAR] Serial error: {e}")
@@ -255,31 +263,36 @@ if __name__ == "__main__":
                         format="%(asctime)s %(levelname)s %(message)s")
 
     print("=" * 50)
-    print("  YDLIDAR X2 Direct Parser — Test")
+    print("  YDLIDAR X2 Parser — Official Protocol Test")
     print("=" * 50)
 
     lidar = LidarX2()
     lidar.start()
 
     print("Waiting for first scan...")
-    for _ in range(20):
+    for _ in range(30):
         time.sleep(0.5)
-        if lidar.is_connected():
-            scan = lidar.get_scan()
-            if scan:
-                print(f"\nGot scan with {len(scan)} points")
-                closest = lidar.get_closest()
-                print(f"Closest obstacle: {closest[1]:.3f}m at {closest[0]:.1f} degrees")
-                print(f"Front sector (0 +/-20deg): {lidar.get_sector_min(0, 20):.3f}m")
-                print(f"Stats: {lidar.get_stats()}")
-
-                print("\nSample points:")
-                for i in range(0, min(len(scan), 360), 36):
-                    a, d = scan[i]
-                    print(f"  {a:6.1f} deg -> {d:.3f}m")
-                break
+        stats = lidar.get_stats()
+        if stats["scan_count"] > 0:
+            scan    = lidar.get_scan()
+            closest = lidar.get_closest()
+            print(f"\nScan {stats['scan_count']}: {len(scan)} points")
+            print(f"Packets OK={stats['packets_ok']}  Bad={stats['packets_bad']}")
+            print(f"Closest: {closest[1]:.3f}m at {closest[0]:.1f}deg")
+            print(f"Front (0+-20deg): {lidar.get_sector_min(0, 20):.3f}m")
+            print("\nAngle distribution (45deg sectors):")
+            sectors = [0] * 8
+            valid = [(a,d) for a,d in scan if MIN_DIST_M <= d <= MAX_DIST_M]
+            for a, d in valid:
+                sectors[int(a / 45)] += 1
+            for i, c in enumerate(sectors):
+                bar = "#" * min(c, 40)
+                print(f"  {i*45:3d}-{i*45+45:3d}deg: {c:4d}  {bar}")
+            break
+        elif stats["packets_ok"] > 0 or stats["packets_bad"] > 0:
+            print(f"  Packets OK={stats['packets_ok']} Bad={stats['packets_bad']}...")
     else:
-        print("No scan received — check wiring")
+        print("No scan received")
 
     lidar.stop()
     print("\nDone")
