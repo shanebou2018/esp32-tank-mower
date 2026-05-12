@@ -10,6 +10,7 @@
 #    heading = compass.get_heading()
 #    data    = compass.get_all()
 #    compass.stop()
+#
 # ============================================================
 
 import threading
