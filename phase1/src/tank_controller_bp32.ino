@@ -122,8 +122,10 @@ unsigned long lastStatusPrint = 0;
 #define PI_CMD_TIMEOUT  500    // ms without Pi command before ignoring Pi drive
 
 // -- Encoder objects -----------------------------------------
-EncAS5600 enc_L;   // left  motor encoder
-EncAS5600 enc_R;   // right motor encoder
+// Config structs set PWM pins before object creation
+as5600config_t cfg_L, cfg_R;
+EncAS5600 *enc_L = nullptr;
+EncAS5600 *enc_R = nullptr;
 
 // -- Encoder state -------------------------------------------
 long  enc_ticks_L  = 0;     // cumulative ticks left
@@ -411,8 +413,8 @@ void sendTelemetry() {
   Serial2.print(F(",\"enc_r\":"));   Serial2.print(enc_ticks_R);
   Serial2.print(F(",\"dist_l\":"));  Serial2.print(enc_dist_L_m, 4);
   Serial2.print(F(",\"dist_r\":"));  Serial2.print(enc_dist_R_m, 4);
-  Serial2.print(F(",\"spd_l\":"));   Serial2.print(enc_L.getSpeed(), 3);
-  Serial2.print(F(",\"spd_r\":"));   Serial2.print(enc_R.getSpeed(), 3);
+  Serial2.print(F(",\"spd_l\":"));   Serial2.print(enc_L ? enc_L->getSpeed() : 0, 3);
+  Serial2.print(F(",\"spd_r\":"));   Serial2.print(enc_R ? enc_R->getSpeed() : 0, 3);
   Serial2.print(F(",\"relay_arm\":"));   Serial2.print(digitalRead(RELAY_ARM));
   Serial2.print(F(",\"relay_motor\":")); Serial2.print(relay_motor  ? 1 : 0);
   Serial2.print(F(",\"relay_turbo\":")); Serial2.print(relay_turbo  ? 1 : 0);
@@ -538,12 +540,8 @@ void encoderTask(void* pvParameters) {
 
 
 // -- Encoder update ------------------------------------------
-void updateOdometry() {
-  enc_ticks_L  = enc_L.getTicks();
-  enc_ticks_R  = enc_R.getTicks();
-  enc_dist_L_m = enc_ticks_L * DIST_PER_DEG_M;
-  enc_dist_R_m = enc_ticks_R * DIST_PER_DEG_M;
-}
+// Odometry updated via encoder callbacks — nothing needed here
+void updateOdometry() { }
 
 // -- Setup ---------------------------------------------------
 
@@ -576,13 +574,24 @@ void setup() {
   Serial.println(F("[INIT] Starting Bluepad32..."));
 
   Serial.println(F("[INIT] Encoder pins..."));
-  // EncAS5600 PWM mode — one object per encoder
-  enc_L.begin(modetype_t::PWM);
-  enc_L.setPwmPin(ENCODER_L_PIN);
-  enc_L.start();
-  enc_R.begin(modetype_t::PWM);
-  enc_R.setPwmPin(ENCODER_R_PIN);
-  enc_R.start();
+  // EncAS5600 PWM mode
+  cfg_L.pwmPin = ENCODER_L_PIN;
+  enc_L = new EncAS5600(modetype_t::PWM, cfg_L);
+  enc_L->begin();
+  enc_L->setEncHandler([](EncAS5600 &e) {
+    enc_ticks_L = e.getTicks();
+    enc_dist_L_m = enc_ticks_L * DIST_PER_DEG_M;
+  });
+  enc_L->start();
+
+  cfg_R.pwmPin = ENCODER_R_PIN;
+  enc_R = new EncAS5600(modetype_t::PWM, cfg_R);
+  enc_R->begin();
+  enc_R->setEncHandler([](EncAS5600 &e) {
+    enc_ticks_R = e.getTicks();
+    enc_dist_R_m = enc_ticks_R * DIST_PER_DEG_M;
+  });
+  enc_R->start();
   Serial.println(F("       EncAS5600 started in PWM mode"));
   Serial.print(F("       Dist per degree=")); Serial.print(DIST_PER_DEG_M * 1000.0f, 4); Serial.println(F("mm"));
   Serial.print(F("       Left  encoder pin=")); Serial.println(ENCODER_L_PIN);
@@ -837,10 +846,10 @@ void loop() {
     Serial.print(F(" R_ticks="));          Serial.print(enc_ticks_R);
     Serial.print(F(" L_dist="));           Serial.print(enc_dist_L_m, 3);
     Serial.print(F("m R_dist="));          Serial.print(enc_dist_R_m, 3);
-    Serial.print(F("m L_spd="));           Serial.print(enc_L.getSpeed(), 3);
-    Serial.print(F(" R_spd="));            Serial.println(enc_R.getSpeed(), 3);
-    Serial.print(F("[ENC  ] L_dir="));     Serial.print(enc_L.getRightDir() ? "CW" : "CCW");
-    Serial.print(F(" R_dir="));            Serial.println(enc_R.getRightDir() ? "CW" : "CCW");
+    Serial.print(F("m L_spd="));           Serial.print(enc_L ? enc_L->getSpeed() : 0, 3);
+    Serial.print(F(" R_spd="));            Serial.println(enc_R ? enc_R->getSpeed() : 0, 3);
+    Serial.print(F("[ENC  ] L_dir="));     Serial.print(enc_L ? (enc_L->getRightDir() ? "CW" : "CCW") : "N/A");
+    Serial.print(F(" R_dir="));            Serial.println(enc_R ? (enc_R->getRightDir() ? "CW" : "CCW") : "N/A");
     Serial.print(F("[TICK] LX=")); Serial.print(gp->axisX());
     Serial.print(F(" LY="));      Serial.print(gp->axisY());
     Serial.print(F(" RX="));      Serial.print(gp->axisRX());
