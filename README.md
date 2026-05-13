@@ -8,8 +8,8 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| **Phase 1** | ✅ Active | Manual RC control via PS4 controller + ESP32 |
-| **Phase 2** | 🔲 Planned | Autonomous navigation via Raspberry Pi + sensors |
+| **Phase 1** | ✅ Complete | Manual RC control via PS4 controller + ESP32 |
+| **Phase 2** | 🚧 Active | Autonomous navigation via Raspberry Pi + sensors |
 
 ---
 
@@ -50,18 +50,23 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
 | Relay — Motor | Pin 33 — latching mower blade relay |
 | Relay — Turbo | Pin 15 — latching turbo relay |
 | Track motors | 2x DC motors via MD13S |
+| Wheel encoders | 2x AS5600 magnetic encoders (PWM mode) |
 
 ### Pin Map — Phase 1
 
-| Signal | ESP32 Pin |
-|--------|-----------|
-| Left track PWM | 25 |
-| Left track DIR | 26 |
-| Right track PWM | 27 |
-| Right track DIR | 14 |
-| Arm relay | 32 |
-| Motor relay | 33 |
-| Turbo relay | 15 |
+| Signal | ESP32 Pin | Notes |
+|--------|-----------|-------|
+| Left track PWM | 25 | Cytron MD13S PWM |
+| Left track DIR | 26 | Cytron MD13S DIR |
+| Right track PWM | 27 | Cytron MD13S PWM |
+| Right track DIR | 14 | Cytron MD13S DIR |
+| Arm relay | 32 | Active HIGH |
+| Motor relay | 33 | Active HIGH, latching |
+| Turbo relay | 15 | Active HIGH, latching |
+| Left encoder PWM | 34 | AS5600 PWM output |
+| Right encoder PWM | 35 | AS5600 PWM output |
+| Pi Serial2 TX | 17 | ESP32 TX2 → Pi GPIO15 (RX) |
+| Pi Serial2 RX | 16 | ESP32 RX2 ← Pi GPIO14 (TX) |
 
 ### Controls — Phase 1
 
@@ -89,9 +94,9 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
 
 ---
 
-## Phase 2 — Autonomous Navigation (Planned)
+## Phase 2 — Autonomous Navigation (In Progress)
 
-Phase 2 adds a Raspberry Pi as the high-level brain. The ESP32 remains as the low-level motor/relay controller and receives commands over a serial bridge from the Pi.
+Phase 2 adds a Raspberry Pi as the high-level brain. The ESP32 firmware has been updated with a full Pi serial bridge (Serial2 on GPIO 16/17), AS5600 magnetic wheel encoders, and telemetry output at 20Hz. The ESP32 remains the low-level motor/relay controller and accepts drive commands from the Pi when no PS4 controller is connected.
 
 ### Planned Hardware — Phase 2
 
