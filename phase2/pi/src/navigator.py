@@ -124,7 +124,44 @@ class Navigator:
         self._avoidance_count = 0
         self._stuck_count     = 0
 
+        # Control gates — both off on boot until user enables from web UI
+        self._movement_enabled  = False
+        self._avoidance_enabled = True   # takes effect when movement is enabled
+
     # ── Public API ───────────────────────────────────────────
+
+    def enable_movement(self):
+        with self._lock:
+            self._movement_enabled = True
+            # Re-enter CLEAR so any stale STUCK state doesn't persist
+            self._state = NavState.CLEAR
+        logger.info("[NAV] Movement ENABLED")
+
+    def disable_movement(self):
+        with self._lock:
+            self._movement_enabled = False
+            self._state = NavState.CLEAR
+        # Don't zero the bridge here — caller decides (coverage keeps state)
+        logger.info("[NAV] Movement DISABLED — motor commands blocked")
+
+    def enable_avoidance(self):
+        with self._lock:
+            self._avoidance_enabled = True
+        logger.info("[NAV] Obstacle avoidance ENABLED")
+
+    def disable_avoidance(self):
+        with self._lock:
+            self._avoidance_enabled = False
+            self._state = NavState.CLEAR
+        logger.info("[NAV] Obstacle avoidance DISABLED — drive commands pass through")
+
+    def is_movement_enabled(self) -> bool:
+        with self._lock:
+            return self._movement_enabled
+
+    def is_avoidance_enabled(self) -> bool:
+        with self._lock:
+            return self._avoidance_enabled
 
     def start(self):
         """Start the reactive control loop."""
@@ -165,12 +202,14 @@ class Navigator:
         right = self._lidar.get_sector_min(RIGHT_CENTER, SIDE_HALF)
         with self._lock:
             return {
-                "state":           self._state,
-                "front_m":         round(front, 2),
-                "left_m":          round(left,  2),
-                "right_m":         round(right, 2),
-                "avoidance_count": self._avoidance_count,
-                "stuck_count":     self._stuck_count,
+                "state":              self._state,
+                "movement_enabled":   self._movement_enabled,
+                "avoidance_enabled":  self._avoidance_enabled,
+                "front_m":            round(front, 2),
+                "left_m":             round(left,  2),
+                "right_m":            round(right, 2),
+                "avoidance_count":    self._avoidance_count,
+                "stuck_count":        self._stuck_count,
             }
 
     def is_clear(self) -> bool:
@@ -190,6 +229,10 @@ class Navigator:
 
     def _tick(self):
         """Called every POLL_INTERVAL. State machine tick."""
+        with self._lock:
+            if not self._movement_enabled:
+                return   # gates closed — no motor commands issued
+
         front = self._lidar.get_sector_min(FRONT_CENTER, FRONT_HALF)
         left  = self._lidar.get_sector_min(LEFT_CENTER,  SIDE_HALF)
         right = self._lidar.get_sector_min(RIGHT_CENTER, SIDE_HALF)
@@ -213,8 +256,16 @@ class Navigator:
     def _tick_normal(self, front, left, right):
         """CLEAR or WARN — pass through or scale coverage request."""
         with self._lock:
-            req_l = self._req_left
-            req_r = self._req_right
+            req_l            = self._req_left
+            req_r            = self._req_right
+            avoidance_on     = self._avoidance_enabled
+
+        if not avoidance_on:
+            # Avoidance disabled — pass drive request straight through
+            self._bridge.drive(req_l, req_r)
+            with self._lock:
+                self._state = NavState.CLEAR
+            return
 
         if front <= STOP_DIST:
             # Transition to BLOCKED

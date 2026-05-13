@@ -1,0 +1,19 @@
+[Unit]
+Description=Tank Mower Phase 2 — Pi navigation stack
+After=network.target
+
+[Service]
+Type=simple
+User=shane
+WorkingDirectory=/home/shane/esp32-tank-mower/phase2/pi
+ExecStart=/usr/bin/python3 /home/shane/esp32-tank-mower/phase2/pi/src/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Give the serial port and I2C time to settle after boot
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=multi-user.target

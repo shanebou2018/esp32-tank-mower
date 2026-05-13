@@ -213,6 +213,33 @@ def api_relay(relay_id, state):
     return jsonify({"ok": True, "relay": relay_id, "state": state})
 
 
+@app.route("/api/nav/enable", methods=["POST"])
+def api_nav_enable():
+    if not navigator:
+        return jsonify({"error": "navigator not initialised"}), 500
+    navigator.enable_movement()
+    return jsonify({"ok": True, "movement_enabled": True})
+
+
+@app.route("/api/nav/disable", methods=["POST"])
+def api_nav_disable():
+    if not navigator:
+        return jsonify({"error": "navigator not initialised"}), 500
+    navigator.disable_movement()
+    return jsonify({"ok": True, "movement_enabled": False})
+
+
+@app.route("/api/nav/avoidance/<int:state>", methods=["POST"])
+def api_nav_avoidance(state):
+    if not navigator:
+        return jsonify({"error": "navigator not initialised"}), 500
+    if state:
+        navigator.enable_avoidance()
+    else:
+        navigator.disable_avoidance()
+    return jsonify({"ok": True, "avoidance_enabled": bool(state)})
+
+
 @app.route("/api/coverage/start", methods=["POST"])
 def api_coverage_start():
     """Start autonomous coverage."""
@@ -338,7 +365,9 @@ h1 { font-size: 1.3rem; color: #00aaff; margin-bottom: 16px; letter-spacing: 2px
     <div class="row"><span class="lbl">State</span><span class="val" id="t-nav">--</span></div>
     <div class="row"><span class="lbl">Front</span><span class="val" id="t-nav-front">--</span></div>
     <div class="row"><span class="lbl">Left / Right</span><span class="val" id="t-nav-sides">--</span></div>
-    <div class="row"><span class="lbl">Avoidances</span><span class="val" id="t-nav-count">--</span></div>
+    <div class="row" style="margin-bottom:8px;"><span class="lbl">Avoidances</span><span class="val" id="t-nav-count">--</span></div>
+    <button class="btn btn-off" id="btn-movement" onclick="toggleMovement()">MOVEMENT — OFF</button>
+    <button class="btn btn-off" id="btn-avoidance" onclick="toggleAvoidance()">AVOIDANCE — ON</button>
   </div>
 
   <!-- Relay controls -->
@@ -440,6 +469,16 @@ function updateAll(s) {
        s.nav.front_m < 0.55 ? 'err' : s.nav.front_m < 1.2 ? 'warn' : 'on');
     sv('t-nav-sides', `L ${s.nav.left_m}m / R ${s.nav.right_m}m`);
     sv('t-nav-count', s.nav.avoidance_count);
+
+    const mb2 = document.getElementById('btn-movement');
+    const movOn = s.nav.movement_enabled;
+    mb2.textContent = movOn ? 'MOVEMENT — ON (click to disable)' : 'MOVEMENT — OFF (click to enable)';
+    mb2.className = 'btn ' + (movOn ? 'btn-motor' : 'btn-off');
+
+    const ab = document.getElementById('btn-avoidance');
+    const avOn = s.nav.avoidance_enabled;
+    ab.textContent = avOn ? 'AVOIDANCE — ON (click to disable)' : 'AVOIDANCE — OFF (click to enable)';
+    ab.className = 'btn ' + (avOn ? 'btn-turbo' : 'btn-off');
   }
 
   // Coverage
@@ -564,6 +603,22 @@ async function startCoverage(mode) {
 async function stopCoverage() {
   log('Coverage STOP', 'info');
   try { await fetch('/api/coverage/stop', {method:'POST'}); }
+  catch(e) { log('Error: '+e,'err'); }
+}
+
+async function toggleMovement() {
+  const movOn = state.nav && state.nav.movement_enabled;
+  const url = movOn ? '/api/nav/disable' : '/api/nav/enable';
+  log('Movement → ' + (movOn ? 'OFF' : 'ON'), movOn ? 'info' : 'ok');
+  try { await fetch(url, {method:'POST'}); }
+  catch(e) { log('Error: '+e,'err'); }
+}
+
+async function toggleAvoidance() {
+  const avOn = state.nav && state.nav.avoidance_enabled;
+  const url = '/api/nav/avoidance/' + (avOn ? '0' : '1');
+  log('Avoidance → ' + (avOn ? 'OFF' : 'ON'), 'info');
+  try { await fetch(url, {method:'POST'}); }
   catch(e) { log('Error: '+e,'err'); }
 }
 
