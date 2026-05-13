@@ -24,6 +24,7 @@
 // ============================================================
 
 #include <Bluepad32.h>
+#include <EncAS5600.h>
 
 // -- Pin definitions -----------------------------------------
 #define MOTOR_A_PWM   25   // Left  track speed  (Cytron MD13S PWM)
@@ -34,6 +35,17 @@
 #define RELAY_ARM     32   // Arm relay    -- ON 500ms before motor, stays ON with motor
 #define RELAY_MOTOR   33   // Motor relay  -- latching, R2 toggle
 #define RELAY_TURBO   15   // Turbo relay  -- latching, L2 toggle
+
+// -- Encoder pins --------------------------------------------
+#define ENCODER_L_PIN   34   // AS5600 left  motor PWM output
+#define ENCODER_R_PIN   35   // AS5600 right motor PWM output
+
+// -- Odometry constants --------------------------------------
+#define WHEEL_DIAMETER_M     0.254f   // 10 inches in meters
+#define GEAR_RATIO           16.0f    // motor turns per wheel turn
+// EncAS5600 counts in degrees (360 per motor rev)
+// dist per degree = (PI * diameter) / (gear_ratio * 360)
+#define DIST_PER_DEG_M       (3.14159265f * WHEEL_DIAMETER_M / (GEAR_RATIO * 360.0f))
 
 // -- Tuning --------------------------------------------------
 #define DEADZONE          6    // Stick dead-zone (Bluepad32: -511..+511)
@@ -99,6 +111,7 @@ int           prev_rightSpeed = 9999;
 
 // Periodic status
 unsigned long lastStatusPrint = 0;
+#define STATUS_INTERVAL_MS 2000
 
 // -- Pi serial bridge (Serial2) ------------------------------
 // ESP32 TX2=GPIO17 -> Pi GPIO15(RX)  |  ESP32 RX2=GPIO16 -> Pi GPIO14(TX)
@@ -107,6 +120,25 @@ unsigned long lastStatusPrint = 0;
 #define PI_BAUD         115200
 #define PI_TELEM_MS     50     // send telemetry to Pi every 50ms (~20Hz)
 #define PI_CMD_TIMEOUT  500    // ms without Pi command before ignoring Pi drive
+
+// -- Encoder objects -----------------------------------------
+EncAS5600 enc_L;   // left  motor encoder
+EncAS5600 enc_R;   // right motor encoder
+
+// -- Encoder state -------------------------------------------
+long  enc_ticks_L  = 0;     // cumulative ticks left
+long  enc_ticks_R  = 0;     // cumulative ticks right
+float enc_dist_L_m = 0.0f;  // total distance left  (m)
+float enc_dist_R_m = 0.0f;  // total distance right (m)
+
+// PWM timing for AS5600
+// PWM timing handled in encoder task
+
+// Speed calculation
+unsigned long lastSpeedCalc = 0;
+long          last_ticks_L  = 0;
+long          last_ticks_R  = 0;
+#define SPEED_CALC_MS 100   // recalculate speed every 100ms
 
 // Pi bridge state
 unsigned long lastTelemSent   = 0;
@@ -375,7 +407,12 @@ int calcDpadSpeed(int rawL2) {
 // Send JSON telemetry to Pi over Serial2
 // Format: {"enc_l":0,"enc_r":0,"relay_arm":0,"relay_motor":0,"relay_turbo":0,"connected":1,"mode":"DUAL","batt":0}
 void sendTelemetry() {
-  Serial2.print(F("{\"enc_l\":0,\"enc_r\":0"));   // placeholder until encoders wired
+  Serial2.print(F("{\"enc_l\":"));   Serial2.print(enc_ticks_L);
+  Serial2.print(F(",\"enc_r\":"));   Serial2.print(enc_ticks_R);
+  Serial2.print(F(",\"dist_l\":"));  Serial2.print(enc_dist_L_m, 4);
+  Serial2.print(F(",\"dist_r\":"));  Serial2.print(enc_dist_R_m, 4);
+  Serial2.print(F(",\"spd_l\":"));   Serial2.print(enc_L.getSpeed(), 3);
+  Serial2.print(F(",\"spd_r\":"));   Serial2.print(enc_R.getSpeed(), 3);
   Serial2.print(F(",\"relay_arm\":"));   Serial2.print(digitalRead(RELAY_ARM));
   Serial2.print(F(",\"relay_motor\":")); Serial2.print(relay_motor  ? 1 : 0);
   Serial2.print(F(",\"relay_turbo\":")); Serial2.print(relay_turbo  ? 1 : 0);
@@ -450,6 +487,64 @@ void parsePiCommand(String line) {
   Serial.print(F("[PI   ] Unknown command: ")); Serial.println(line);
 }
 
+// -- Encoder ISRs --------------------------------------------
+
+// AS5600 PWM mode: pulse width 1us-4097us maps to 0-360 degrees
+// We detect angle and count full rotations
+
+// Read AS5600 PWM angle using pulseIn (blocking but accurate)
+// Called from encoder task running on Core 0
+int readAS5600Angle(uint8_t pin) {
+  unsigned long high = pulseIn(pin, HIGH, 20000);  // timeout 20ms
+  if (high == 0) return -1;  // timeout
+  // AS5600 PWM: high pulse 1us-4097us = 0-360deg
+  int angle = (int)((high - 1) * 360 / 4096);
+  return constrain(angle, 0, 359);
+}
+
+// Encoder task runs on Core 0, leaving Core 1 for Bluepad32/main loop
+void encoderTask(void* pvParameters) {
+  int prev_L = -1;
+  int prev_R = -1;
+  for (;;) {
+    // Left encoder
+    int angle_L = readAS5600Angle(ENCODER_L_PIN);
+    if (angle_L >= 0 && prev_L >= 0) {
+      int diff = angle_L - prev_L;
+      if (diff >  180) diff -= 360;
+      if (diff < -180) diff += 360;
+      if (abs(diff) < 90) {  // sanity check -- ignore jumps > 90deg
+        enc_ticks_L += diff;
+      }
+    }
+    if (angle_L >= 0) prev_L = angle_L;
+
+    // Right encoder
+    int angle_R = readAS5600Angle(ENCODER_R_PIN);
+    if (angle_R >= 0 && prev_R >= 0) {
+      int diff = angle_R - prev_R;
+      if (diff >  180) diff -= 360;
+      if (diff < -180) diff += 360;
+      if (abs(diff) < 90) {
+        enc_ticks_R += diff;
+      }
+    }
+    if (angle_R >= 0) prev_R = angle_R;
+
+    vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms delay between reads
+  }
+}
+
+
+
+// -- Encoder update ------------------------------------------
+void updateOdometry() {
+  enc_ticks_L  = enc_L.getTicks();
+  enc_ticks_R  = enc_R.getTicks();
+  enc_dist_L_m = enc_ticks_L * DIST_PER_DEG_M;
+  enc_dist_R_m = enc_ticks_R * DIST_PER_DEG_M;
+}
+
 // -- Setup ---------------------------------------------------
 
 void setup() {
@@ -480,6 +575,20 @@ void setup() {
 
   Serial.println(F("[INIT] Starting Bluepad32..."));
 
+  Serial.println(F("[INIT] Encoder pins..."));
+  // EncAS5600 PWM mode — one object per encoder
+  enc_L.begin(modetype_t::PWM);
+  enc_L.setPwmPin(ENCODER_L_PIN);
+  enc_L.start();
+  enc_R.begin(modetype_t::PWM);
+  enc_R.setPwmPin(ENCODER_R_PIN);
+  enc_R.start();
+  Serial.println(F("       EncAS5600 started in PWM mode"));
+  Serial.print(F("       Dist per degree=")); Serial.print(DIST_PER_DEG_M * 1000.0f, 4); Serial.println(F("mm"));
+  Serial.print(F("       Left  encoder pin=")); Serial.println(ENCODER_L_PIN);
+  Serial.print(F("       Right encoder pin=")); Serial.println(ENCODER_R_PIN);
+  Serial.print(F("       Dist per degree=")); Serial.print(DIST_PER_DEG_M * 1000.0f, 4); Serial.println(F("mm"));
+
   Serial.println(F("[INIT] Starting Pi serial bridge (Serial2)..."));
   Serial2.begin(PI_BAUD, SERIAL_8N1, PI_SERIAL_RX, PI_SERIAL_TX);
   Serial.print(F("       TX2=GPIO")); Serial.print(PI_SERIAL_TX);
@@ -503,6 +612,9 @@ void loop() {
 
   // 1. Arm state machine (non-blocking, runs every iteration)
   updateArmStateMachine();
+
+  // 1b. Odometry update
+  updateOdometry();
 
   // 2. Pi serial bridge — read incoming commands
   while (Serial2.available()) {
@@ -721,6 +833,14 @@ void loop() {
   // -- Periodic status dump ----------------------------------
   if (millis() - lastStatusPrint > STATUS_INTERVAL_MS) {
     lastStatusPrint = millis();
+    Serial.print(F("[ENC  ] L_ticks=")); Serial.print(enc_ticks_L);
+    Serial.print(F(" R_ticks="));          Serial.print(enc_ticks_R);
+    Serial.print(F(" L_dist="));           Serial.print(enc_dist_L_m, 3);
+    Serial.print(F("m R_dist="));          Serial.print(enc_dist_R_m, 3);
+    Serial.print(F("m L_spd="));           Serial.print(enc_L.getSpeed(), 3);
+    Serial.print(F(" R_spd="));            Serial.println(enc_R.getSpeed(), 3);
+    Serial.print(F("[ENC  ] L_dir="));     Serial.print(enc_L.getRightDir() ? "CW" : "CCW");
+    Serial.print(F(" R_dir="));            Serial.println(enc_R.getRightDir() ? "CW" : "CCW");
     Serial.print(F("[TICK] LX=")); Serial.print(gp->axisX());
     Serial.print(F(" LY="));      Serial.print(gp->axisY());
     Serial.print(F(" RX="));      Serial.print(gp->axisRX());
