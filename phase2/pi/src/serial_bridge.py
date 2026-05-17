@@ -4,7 +4,7 @@
 #
 # ESP32 wiring:
 #   ESP32 TX2 (GPIO17) -> Pi GPIO15 (RX)
-#   ESP32 RX2 (GPIO16) -> Pi GPIO14 (TX)
+#   ESP32 RX2 (GPIO13) -> Pi GPIO14 (TX)   [moved from GPIO16 — WS2811]
 #   Common GND
 #
 # Usage:
@@ -81,6 +81,14 @@ class ESP32Bridge:
             "connected":   0,   # PS4 controller connected on ESP32
             "mode":        "DUAL",
             "batt":        0,
+            # PCF8575 mower I/O
+            "bat1":        0,   # battery 1 level: 0 / 25 / 50 / 75 / 100
+            "bat1_heat":   0,
+            "bat2":        0,   # battery 2 level: 0 / 25 / 50 / 75 / 100
+            "bat2_heat":   0,
+            "mower_err":   0,   # mower error (hardware latched on mower)
+            "turbo_fb":    0,   # turbo feedback (hardware latched on mower)
+            "lights":      0,   # mower lights state (software toggle)
             # Internal bookkeeping
             "last_rx":     0.0, # timestamp of last good telemetry packet
         }
@@ -206,6 +214,26 @@ class ESP32Bridge:
         with self._lock:
             return bool(self._state["relay_turbo"])
 
+    def press_pcf_button(self, button_id: str):
+        """
+        Trigger a 200ms momentary press of a PCF8575 mower button.
+          button_id: "turbo_btn" or "lights_btn"
+        """
+        if button_id not in ("turbo_btn", "lights_btn"):
+            logger.warning(f"[BRIDGE] Unknown PCF button: {button_id}")
+            return
+        self._send({"cmd": "pcf", "id": button_id})
+        logger.info(f"[BRIDGE] PCF button press: {button_id}")
+
+    def mower_error(self) -> bool:
+        with self._lock:
+            return bool(self._state["mower_err"])
+
+    def bat_levels(self) -> tuple:
+        """Returns (bat1_level, bat2_level) as integers 0/25/50/75/100."""
+        with self._lock:
+            return self._state["bat1"], self._state["bat2"]
+
     # ── Private helpers ──────────────────────────────────────
 
     def _send(self, obj: dict):
@@ -311,8 +339,9 @@ if __name__ == "__main__":
 
         print("\n[TEST] Bridge started. Listening for 5 seconds...\n")
         print(f"{'#':>4}  {'enc_l':>8}  {'enc_r':>8}  "
-              f"{'dist_l':>8}  {'dist_r':>8}  {'motor':>6}  {'batt':>5}")
-        print("-" * 60)
+              f"{'dist_l':>8}  {'dist_r':>8}  {'motor':>6}  {'batt':>5}  "
+              f"{'bat1':>5}  {'bat2':>5}  {'err':>4}  {'tfb':>4}")
+        print("-" * 85)
 
         for i in range(10):
             time.sleep(0.5)
@@ -322,7 +351,11 @@ if __name__ == "__main__":
                 f"{s['enc_l']:>8}  {s['enc_r']:>8}  "
                 f"{s['dist_l']:>8.3f}  {s['dist_r']:>8.3f}  "
                 f"{'ON' if s['relay_motor'] else 'off':>6}  "
-                f"{s['batt']:>4}%"
+                f"{s['batt']:>4}%  "
+                f"{s['bat1']:>4}%  "
+                f"{s['bat2']:>4}%  "
+                f"{'YES' if s['mower_err'] else 'no':>4}  "
+                f"{'ON' if s['turbo_fb'] else 'off':>4}"
             )
 
         print("\n[TEST] Driving forward (L=80 R=80) for 2 seconds...")

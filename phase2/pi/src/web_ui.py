@@ -76,6 +76,19 @@ HTML = """
     .lidar-stats { font-size: 0.72rem; color: #555; margin-top: 6px; }
     .lidar-stats span { color: #888; margin-right: 12px; }
     .footer { font-size: 0.65rem; color: #333; margin-top: 12px; }
+
+    .bat-bar { background: #111; border: 1px solid #2a2a2a; border-radius: 3px; height: 8px; overflow: hidden; margin: 3px 0 6px; }
+    .bat-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease, background-color 0.3s; }
+
+    .error-banner { background: #ff1a1a22; border: 1px solid #ff4444; color: #ff4444;
+                    border-radius: 4px; padding: 5px 10px; margin-bottom: 10px;
+                    font-size: 0.78rem; font-weight: bold; letter-spacing: 1px;
+                    animation: error-pulse 1s infinite; }
+    @keyframes error-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .card.error-active { border-color: #ff444488; }
+
+    .btn-lights-on { background: #ffaa00; color: #000; }
+    .btn-pcf       { background: #1e1e2e; color: #aaa; border: 1px solid #444; }
   </style>
 </head>
 <body>
@@ -95,6 +108,49 @@ HTML = """
       <div class="telem-row"><span class="telem-label">TURBO relay</span><span class="telem-value" id="t-turbo">--</span></div>
       <div class="telem-row"><span class="telem-label">Enc L</span><span class="telem-value" id="t-encl">--</span></div>
       <div class="telem-row"><span class="telem-label">Enc R</span><span class="telem-value" id="t-encr">--</span></div>
+    </div>
+
+    <div class="card" id="mower-card">
+      <h2>Mower</h2>
+      <div class="error-banner" id="mower-err-banner" style="display:none">&#9888; MOWER ERROR</div>
+
+      <div class="telem-row">
+        <span class="telem-label">Battery 1</span>
+        <span class="telem-value" id="t-bat1">--</span>
+      </div>
+      <div class="bat-bar"><div class="bat-fill" id="bat1-fill" style="width:0%"></div></div>
+      <div class="telem-row" style="margin-top:-2px">
+        <span class="telem-label" style="font-size:0.75rem">&#9661; Heat</span>
+        <span class="telem-value" id="t-bat1-heat">--</span>
+      </div>
+
+      <div class="telem-row" style="margin-top:6px">
+        <span class="telem-label">Battery 2</span>
+        <span class="telem-value" id="t-bat2">--</span>
+      </div>
+      <div class="bat-bar"><div class="bat-fill" id="bat2-fill" style="width:0%"></div></div>
+      <div class="telem-row" style="margin-top:-2px">
+        <span class="telem-label" style="font-size:0.75rem">&#9661; Heat</span>
+        <span class="telem-value" id="t-bat2-heat">--</span>
+      </div>
+
+      <div class="telem-row" style="margin-top:6px">
+        <span class="telem-label">Mower Error</span>
+        <span class="telem-value" id="t-mower-err">--</span>
+      </div>
+      <div class="telem-row">
+        <span class="telem-label">Turbo FB</span>
+        <span class="telem-value" id="t-turbo-fb">--</span>
+      </div>
+
+      <button class="relay-btn btn-off" id="btn-lights"
+              onclick="pressMowerBtn('lights_btn')" style="margin-top:10px">
+        LIGHTS — OFF
+      </button>
+      <button class="relay-btn btn-pcf"
+              onclick="pressMowerBtn('turbo_btn')">
+        MOWER TURBO PRESS
+      </button>
     </div>
 
     <div class="card">
@@ -163,6 +219,42 @@ HTML = """
     el.className = 'telem-value ' + (cls || '');
   }
 
+  function batColor(level) {
+    if (level >= 100) return '#00ff88';
+    if (level >= 75)  return '#aaff00';
+    if (level >= 50)  return '#ffaa00';
+    if (level >= 25)  return '#ff6600';
+    return '#333';
+  }
+
+  function updateMower(s) {
+    const err = !!s.mower_err;
+    document.getElementById('mower-card').classList.toggle('error-active', err);
+    document.getElementById('mower-err-banner').style.display = err ? 'block' : 'none';
+    setVal('t-mower-err', err ? 'ERROR' : 'OK', err ? 'err' : 'on');
+    setVal('t-turbo-fb',  s.turbo_fb ? 'ACTIVE' : 'off', s.turbo_fb ? 'on' : '');
+
+    const b1 = s.bat1 || 0;
+    const b2 = s.bat2 || 0;
+    setVal('t-bat1', b1 ? b1 + '%' : '--', b1 >= 50 ? 'on' : b1 >= 25 ? 'warn' : b1 > 0 ? 'err' : '');
+    setVal('t-bat2', b2 ? b2 + '%' : '--', b2 >= 50 ? 'on' : b2 >= 25 ? 'warn' : b2 > 0 ? 'err' : '');
+
+    const f1 = document.getElementById('bat1-fill');
+    f1.style.width = b1 + '%';
+    f1.style.backgroundColor = batColor(b1);
+
+    const f2 = document.getElementById('bat2-fill');
+    f2.style.width = b2 + '%';
+    f2.style.backgroundColor = batColor(b2);
+
+    setVal('t-bat1-heat', s.bat1_heat ? 'HOT' : 'OK', s.bat1_heat ? 'err' : 'on');
+    setVal('t-bat2-heat', s.bat2_heat ? 'HOT' : 'OK', s.bat2_heat ? 'err' : 'on');
+
+    const lb = document.getElementById('btn-lights');
+    lb.textContent  = s.lights ? 'LIGHTS — ON  (press to toggle)' : 'LIGHTS — OFF  (press to toggle)';
+    lb.className    = 'relay-btn ' + (s.lights ? 'btn-lights-on' : 'btn-off');
+  }
+
   function updateESP32(s) {
     const online = s.bridge_connected;
     document.getElementById('conn-dot').className = 'dot ' + (online ? 'online' : '');
@@ -185,6 +277,7 @@ HTML = """
     tb.textContent = s.relay_turbo ? 'TURBO - ON  (press to OFF)' : 'TURBO - OFF  (press to ON)';
     tb.className = 'relay-btn ' + (s.relay_turbo ? 'btn-turbo-on' : 'btn-off');
 
+    updateMower(s);
     state = s;
   }
 
@@ -326,6 +419,13 @@ HTML = """
     } catch(e) { addLog('Error: ' + e, 'err'); }
   }
 
+  async function pressMowerBtn(id) {
+    addLog('Mower button: ' + id, 'info');
+    try {
+      await fetch('/api/pcf/' + id, { method: 'POST' });
+    } catch(e) { addLog('Error: ' + e, 'err'); }
+  }
+
   fetchState(); fetchLidar(); fetchCompass();
   setInterval(fetchState,   500);
   setInterval(fetchLidar,   200);
@@ -370,6 +470,13 @@ def api_relay(relay_id, state):
         return jsonify({"error": "unknown relay"}), 400
     bridge.set_relay(relay_id, bool(state))
     return jsonify({"ok": True, "relay": relay_id, "state": state})
+
+@app.route("/api/pcf/<button_id>", methods=["POST"])
+def api_pcf(button_id):
+    if button_id not in ("turbo_btn", "lights_btn"):
+        return jsonify({"error": "unknown button"}), 400
+    bridge.press_pcf_button(button_id)
+    return jsonify({"ok": True, "button": button_id})
 
 @app.route("/api/compass")
 def api_compass():
