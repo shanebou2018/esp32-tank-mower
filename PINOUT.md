@@ -3,12 +3,12 @@
 
 ---
 
-### 🔵 Motors (Cytron MD13S)
+### 🔵 Motors (Cytron MDDS30 — dual channel)
 ```
-GPIO 25 → Left  PWM
-GPIO 26 → Left  DIR
-GPIO 27 → Right PWM
-GPIO 14 → Right DIR
+GPIO 25 → PWM1 (Left)
+GPIO 26 → DIR1 (Left)
+GPIO 27 → PWM2 (Right)
+GPIO 14 → DIR2 (Right)
 ```
 
 ---

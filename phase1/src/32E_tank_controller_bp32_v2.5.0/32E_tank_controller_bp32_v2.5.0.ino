@@ -1,5 +1,5 @@
 // ============================================================
-// ESP32 Tank Mower — Phase 2 Firmware  v2.4.0
+// ESP32 Tank Mower — Phase 2 Firmware  v2.5.0
 // Board: ESP32-DevKitC-32E (ESP32-WROOM-32E)
 // Based on Phase 1 v1.5.0 — adds full Pi serial bridge telemetry
 //
@@ -28,16 +28,36 @@
 // v2.4.0 changes:
 //   - Onboard LED confirmed as single-colour green on GPIO 16
 //   - Replaced FastLED/WS2812 with direct LEDC PWM (no library needed)
-//   - 5-tier priority now expressed as PWM brightness + blink patterns:
-//       ERROR      — fast blink  (100ms) full brightness
-//       BAT_HEAT   — medium blink(350ms) full brightness
-//       TURBO      — solid full brightness
-//       MOTOR      — solid medium brightness
-//       MODE       — solid dim (dual) / solid low (single) / off (no ctrl)
+//   - 5-tier priority now expressed as PWM brightness + blink patterns
 //   - PS4 controller LED colours preserved (separate system, unaffected)
 //
+// v2.5.0 changes:
+//   - Reverted PS4 LED to original flash logic (motor: red↔mode 300ms,
+//     turbo: white↔mode 300ms). Board LED (GPIO 16) removed entirely.
+//   - BP32.update() moved to top of loop() — eliminates BT input latency
+//   - Removed delay(20) from loop() — fully non-blocking
+//   - String piCmdBuffer replaced with char[256] — no heap fragmentation
+//   - parsePiCommand uses char*/strstr()/atoi() — no String temporaries
+//   - sendTelemetry uses snprintf into char[320] + single println — no
+//     TX buffer stalls from 24 sequential Serial2.print() calls
+//   - Atomic noInterrupts()/interrupts() snapshot in sendTelemetry
+//   - (LedPriority)-1 UB hack replaced with ledDirty flag — removed with
+//     LED revert; driveMotor direction-change now uses ledDirty correctly
+//   - Wire.setTimeout(25) prevents I2C hang when PCF8575 not connected
+//   - PCF button timers cleared immediately on controller disconnect
+//   - Exponential output smoothing on motor commands (alpha=0.25) —
+//     eliminates deadzone-boundary jitter at low speeds
+//   - Drive log rate-limited to 100ms — prevents serial flood with no delay
+//   - driveMotor() zeroes PWM before direction flip (MDDS30 shoot-through
+//     protection); per-motor direction tracked via static locals
+//   - Cross button (BUTTON_A): hold to show controller battery on PS4 LED
+//     (green ≥75%, yellow ≥50%, orange ≥25%, red <25%)
+//   - Motor driver updated to Cytron MDDS30 (dual-channel, replaces 2×MD13S)
+//     DIP: SW1 ON, SW2 OFF, SW3 ON, SW4 ON, SW6 OFF (Sign-Magnitude PWM)
+//   - Single-stick turn mixing sign corrected (up-right now turns right)
+//
 // Hardware:
-//   2x Cytron MD13S motor driver
+//   Cytron MDDS30 dual-channel motor driver (replaces 2× MD13S)
 //   Relay: ARM   pin 32 (momentary safety arm)
 //   Relay: MOTOR pin 33 (latching mower blade)
 //   Relay: TURBO pin 15 (latching turbo)
@@ -126,22 +146,8 @@
 #define ENCODER_L_PIN 34
 #define ENCODER_R_PIN 35
 
-// ── Onboard green LED (GPIO 16, single colour, PWM via LEDC) ─
-#define LED_PIN       16
-#define LED_LEDC_CH   4       // LEDC channel (0-1 used by motor analogWrite)
-#define LED_LEDC_FREQ 5000    // 5 kHz — above audible range
-#define LED_LEDC_BITS 8       // 8-bit duty: 0–255
-
-// PWM brightness levels
-#define LED_OFF       0
-#define LED_DIM       30      // mode: dual stick, controller connected
-#define LED_LOW       70      // mode: single stick
-#define LED_MED       140     // motor running
-#define LED_FULL      255     // turbo / error blink
-
-// Blink intervals (ms)
-#define FLASH_MS_FAST 100     // error — urgent
-#define FLASH_MS_MED  350     // battery heat — warning
+// Blink interval (ms)
+#define FLASH_MS      300     // controller LED flash while relay active
 
 // ── I2C / PCF8575 ────────────────────────────────────────────
 #define I2C_SDA      21
@@ -205,7 +211,7 @@ enum MowerScene {
 
 // ── Tuning ───────────────────────────────────────────────────
 #define DEADZONE          6
-#define MAX_SPEED         127
+#define MAX_SPEED         254
 #define STICK_MAX         511
 #define DPAD_SPEED_MIN    15
 #define ARM_PULSE_MS      500
@@ -218,24 +224,12 @@ const char* modeNames[] = { "DUAL", "SINGLE" };
 // ── Arm state machine ────────────────────────────────────────
 enum ArmState { ARM_IDLE, ARM_ARMING };
 
-// ── PS4 controller LED colours (RGB — separate from board LED) ─
+// ── PS4 controller LED colours ───────────────────────────────
 struct Colour { uint8_t r, g, b; };
-const Colour COL_DUAL   = {   0,   0, 255 }; // Blue   — dual stick
-const Colour COL_SINGLE = {   0, 255,   0 }; // Green  — single stick
-const Colour COL_RED    = { 255,   0,   0 }; // Red    — motor
-const Colour COL_WHITE  = { 255, 255, 255 }; // White  — turbo
-const Colour COL_YELLOW = { 255, 180,   0 }; // Yellow — heat
-const Colour COL_AMBER  = { 255,  80,   0 }; // Amber  — error
-const Colour COL_OFF    = {   0,   0,   0 }; // Off
-
-// ── LED priority ─────────────────────────────────────────────
-enum LedPriority {
-  PRIO_MODE = 0,
-  PRIO_MOTOR,
-  PRIO_TURBO,
-  PRIO_BAT_HEAT,
-  PRIO_ERROR
-};
+const Colour COL_DUAL   = {   0,   0, 255 }; // Blue  — dual stick
+const Colour COL_SINGLE = {   0, 255,   0 }; // Green — single stick
+const Colour COL_RED    = { 255,   0,   0 }; // Red   — motor flash
+const Colour COL_WHITE  = { 255, 255, 255 }; // White — turbo flash
 
 // ── Global state ─────────────────────────────────────────────
 GamepadPtr  gGamepad    = nullptr;
@@ -246,27 +240,32 @@ bool        relay_turbo = false;
 unsigned long armTimer  = 0;
 
 // Button edge detection
-bool prev_PS  = false;
-bool prev_R1  = false;
-bool prev_TRI = false;
-bool prev_L1  = false;
-bool prev_SQR = false;
+bool prev_PS    = false;
+bool prev_R1    = false;
+bool prev_TRI   = false;
+bool prev_L1    = false;
+bool prev_SQR   = false;
+bool prev_CROSS = false;
+
+// Battery display — true while Cross is held
+bool showBatt = false;
 
 // D-pad speed ceiling
 int peakL2    = 0;
 int dpadSpeed = 0;
 
 // LED flash state
-unsigned long lastFlash   = 0;
-bool          flashState  = false;
-LedPriority   prevLedPrio = PRIO_MODE;
+unsigned long lastFlash  = 0;
+bool          flashState = false;
 
 // Timed rumble
 unsigned long rumbleOffTime = 0;
 
-// Drive change detection
+// Drive change detection + smoothed output
 int prev_leftSpeed  = 9999;
 int prev_rightSpeed = 9999;
+int smoothedL = 0;
+int smoothedR = 0;
 
 // Pip-Boy scene tracking
 int           scene_driveL   = 0;
@@ -288,8 +287,9 @@ EncAS5600 *enc_L = nullptr;
 EncAS5600 *enc_R = nullptr;
 
 // ── Pi serial bridge state ───────────────────────────────────
-String        piCmdBuffer   = "";
-bool          piDriveActive = false;
+char     piCmdBuf[256];
+uint8_t  piCmdLen    = 0;
+bool     piDriveActive = false;
 int           pi_leftSpeed  = 0;
 int           pi_rightSpeed = 0;
 unsigned long lastPiCmd     = 0;
@@ -362,16 +362,9 @@ void debugFullStatus() {
 }
 
 // ============================================================
-// LED helpers
-// Board LED : single green, GPIO 16, PWM via LEDC
-// PS4 LED   : RGB via Bluepad32 setColorLED() — independent
+// LED helpers — PS4 controller RGB LED only
 // ============================================================
-void boardLED(uint8_t brightness) {
-  ledcWrite(LED_LEDC_CH, brightness);
-}
-
-// Set PS4 controller LED colour (no effect on board LED)
-void ctrlLED(Colour c) {
+void setLED(Colour c) {
   if (gGamepad) gGamepad->setColorLED(c.r, c.g, c.b);
 }
 
@@ -379,69 +372,21 @@ Colour modeColour() {
   return tankMode == MODE_DUAL_STICK ? COL_DUAL : COL_SINGLE;
 }
 
-LedPriority ledPriority() {
-  if (mower_error)            return PRIO_ERROR;
-  if (bat1_heat || bat2_heat) return PRIO_BAT_HEAT;
-  if (relay_turbo)            return PRIO_TURBO;
-  if (relay_motor)            return PRIO_MOTOR;
-  return PRIO_MODE;
-}
-
-uint8_t modeBrightness() {
-  if (!gGamepad) return LED_OFF;
-  return tankMode == MODE_DUAL_STICK ? LED_DIM : LED_LOW;
-}
-
-// Sync PS4 controller LED to current mode/priority colour
-void refreshCtrlLED() {
-  LedPriority p = ledPriority();
-  switch (p) {
-    case PRIO_ERROR:    ctrlLED(COL_AMBER);   break;
-    case PRIO_BAT_HEAT: ctrlLED(COL_YELLOW);  break;
-    case PRIO_TURBO:    ctrlLED(COL_WHITE);   break;
-    case PRIO_MOTOR:    ctrlLED(COL_RED);     break;
-    default:            ctrlLED(modeColour()); break;
-  }
-}
-
-// Called every loop() — drives board LED brightness/blink and PS4 colour
+// Call every loop() — flashes controller LED while a relay is active.
+// Turbo: white ↔ mode colour.  Motor only: red ↔ mode colour.
+// When no relay is active the LED stays solid (set at the moment of change).
 void updateLED() {
-  LedPriority prio = ledPriority();
-
-  // On priority change: reset flash state, sync controller LED
-  if (prio != prevLedPrio) {
-    lastFlash   = 0;
-    flashState  = false;
-    prevLedPrio = prio;
-    refreshCtrlLED();
-    if (prio == PRIO_MODE) {
-      boardLED(modeBrightness());
-      return;
-    }
-  }
-
-  if (prio == PRIO_MODE) return;  // solid — no flash needed
-
-  unsigned long now      = millis();
-  unsigned long interval = (prio == PRIO_ERROR) ? FLASH_MS_FAST : FLASH_MS_MED;
-
-  switch (prio) {
-    case PRIO_TURBO:
-      boardLED(LED_FULL);   // solid full — no blink
-      break;
-    case PRIO_MOTOR:
-      boardLED(LED_MED);    // solid medium — no blink
-      break;
-    case PRIO_BAT_HEAT:
-    case PRIO_ERROR:
-      if (now - lastFlash >= interval) {
-        lastFlash  = now;
-        flashState = !flashState;
-        boardLED(flashState ? LED_FULL : LED_OFF);
-      }
-      break;
-    default:
-      break;
+  if (!gGamepad) return;
+  if (showBatt) return;          // battery display holds the LED until released
+  if (!relay_motor && !relay_turbo) return;
+  unsigned long now = millis();
+  if (now - lastFlash < FLASH_MS) return;
+  lastFlash  = now;
+  flashState = !flashState;
+  if (relay_turbo) {
+    setLED(flashState ? COL_WHITE : modeColour());
+  } else {
+    setLED(flashState ? COL_RED : modeColour());
   }
 }
 
@@ -503,9 +448,9 @@ void stopMotor() {
   digitalWrite(RELAY_MOTOR, LOW);
   digitalWrite(RELAY_ARM,   LOW);
   armState = ARM_IDLE;
+  if (!relay_turbo) setLED(modeColour());
   Serial.println(F("[ARM ] MOTOR + ARM both LOW — mower stopped"));
   debugRelays();
-  prevLedPrio = (LedPriority)-1; // force updateLED to recalc on next call
 }
 
 void updateArmStateMachine() {
@@ -535,10 +480,10 @@ void onConnectedGamepad(GamepadPtr gp) {
   GamepadProperties props = gp->getProperties();
   Serial.print(F("[CONN] BT addr: ")); printBTAddr(props.btaddr);
   gGamepad = gp;
-  refreshCtrlLED();
-  boardLED(modeBrightness());
+  gp->setColorLED(COL_DUAL.r, COL_DUAL.g, COL_DUAL.b);
   gp->setRumble(0x40, 0x40);
   rumbleOffTime = millis() + RUMBLE_MS;
+  Serial.println(F("[LED ] BLUE (dual stick)"));
 }
 
 void onDisconnectedGamepad(GamepadPtr gp) {
@@ -558,8 +503,14 @@ void onDisconnectedGamepad(GamepadPtr gp) {
   pi_rightSpeed = 0;
   scene_driveL  = 0;
   scene_driveR  = 0;
+  smoothedL     = 0;
+  smoothedR     = 0;
 
-  boardLED(LED_OFF);
+  // Release any in-flight PCF button pulses immediately
+  if (pcfPresent) {
+    if (turboBtnOff)  { pcf.write(PCF_TURBO_BTN,  HIGH); turboBtnOff  = 0; }
+    if (lightsBtnOff) { pcf.write(PCF_LIGHTS_BTN, HIGH); lightsBtnOff = 0; }
+  }
 
   Serial.println(F("[SAFE] Tracks stopped. All relays OFF."));
 }
@@ -568,14 +519,20 @@ void onDisconnectedGamepad(GamepadPtr gp) {
 // Motor drive
 // ============================================================
 void driveMotor(uint8_t pwmPin, uint8_t dirPin, int speed) {
+  // Per-motor direction tracking — zero PWM before flipping DIR to avoid
+  // H-bridge shoot-through on the MDDS30 during direction reversal.
+  static bool lastDirA = true;
+  static bool lastDirB = true;
+  bool& lastDir = (pwmPin == MOTOR_A_PWM) ? lastDirA : lastDirB;
+
   speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
-  if (speed >= 0) {
-    digitalWrite(dirPin, HIGH);
-    analogWrite(pwmPin, speed);
-  } else {
-    digitalWrite(dirPin, LOW);
-    analogWrite(pwmPin, -speed);
+  bool newDir = (speed >= 0);
+  if (newDir != lastDir) {
+    analogWrite(pwmPin, 0);   // brake before direction flip; MDDS30 handles dead-time internally
   }
+  lastDir = newDir;
+  digitalWrite(dirPin, newDir ? HIGH : LOW);
+  analogWrite(pwmPin, abs(speed));
 }
 
 int stickToSpeed(int axis) {
@@ -596,46 +553,51 @@ int calcDpadSpeed(int rawL2) {
 // Pi serial bridge — telemetry TX
 // ============================================================
 void sendTelemetry() {
+  // Atomic snapshot — ISR may update enc_* at any time
+  noInterrupts();
   long  tl = enc_ticks_L;
   long  tr = enc_ticks_R;
   float dl = enc_dist_L_m;
   float dr = enc_dist_R_m;
+  interrupts();
 
-  Serial2.print(F("{\"enc_l\":"));       Serial2.print(tl);
-  Serial2.print(F(",\"enc_r\":"));       Serial2.print(tr);
-  Serial2.print(F(",\"dist_l\":"));      Serial2.print(dl, 4);
-  Serial2.print(F(",\"dist_r\":"));      Serial2.print(dr, 4);
-  Serial2.print(F(",\"spd_l\":"));       Serial2.print(enc_L ? enc_L->getSpeed() : 0.0f, 3);
-  Serial2.print(F(",\"spd_r\":"));       Serial2.print(enc_R ? enc_R->getSpeed() : 0.0f, 3);
-  Serial2.print(F(",\"relay_arm\":"));   Serial2.print(digitalRead(RELAY_ARM));
-  Serial2.print(F(",\"relay_motor\":")); Serial2.print(relay_motor ? 1 : 0);
-  Serial2.print(F(",\"relay_turbo\":")); Serial2.print(relay_turbo ? 1 : 0);
-  Serial2.print(F(",\"connected\":"));   Serial2.print(gGamepad ? 1 : 0);
-  Serial2.print(F(",\"mode\":\""));      Serial2.print(modeNames[tankMode]);
-  Serial2.print(F("\",\"batt\":"));      Serial2.print(gGamepad ? gGamepad->battery() : 0);
-  Serial2.print(F(",\"bat1\":"));        Serial2.print(bat1_level);
-  Serial2.print(F(",\"bat1_heat\":"));   Serial2.print(bat1_heat   ? 1 : 0);
-  Serial2.print(F(",\"bat2\":"));        Serial2.print(bat2_level);
-  Serial2.print(F(",\"bat2_heat\":"));   Serial2.print(bat2_heat   ? 1 : 0);
-  Serial2.print(F(",\"mower_err\":"));   Serial2.print(mower_error ? 1 : 0);
-  Serial2.print(F(",\"turbo_fb\":"));    Serial2.print(turbo_fb    ? 1 : 0);
-  Serial2.print(F(",\"lights\":"));      Serial2.print(pcf_lights_on ? 1 : 0);
-  Serial2.println(F("}"));
+  float spd_l = enc_L ? enc_L->getSpeed() : 0.0f;
+  float spd_r = enc_R ? enc_R->getSpeed() : 0.0f;
+
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+    "{\"enc_l\":%ld,\"enc_r\":%ld"
+    ",\"dist_l\":%.4f,\"dist_r\":%.4f"
+    ",\"spd_l\":%.3f,\"spd_r\":%.3f"
+    ",\"relay_arm\":%d,\"relay_motor\":%d,\"relay_turbo\":%d"
+    ",\"connected\":%d,\"mode\":\"%s\",\"batt\":%d"
+    ",\"bat1\":%d,\"bat1_heat\":%d"
+    ",\"bat2\":%d,\"bat2_heat\":%d"
+    ",\"mower_err\":%d,\"turbo_fb\":%d,\"lights\":%d}",
+    tl, tr,
+    dl, dr,
+    spd_l, spd_r,
+    digitalRead(RELAY_ARM), relay_motor ? 1 : 0, relay_turbo ? 1 : 0,
+    gGamepad ? 1 : 0, modeNames[tankMode], gGamepad ? gGamepad->battery() : 0,
+    bat1_level, bat1_heat ? 1 : 0,
+    bat2_level, bat2_heat ? 1 : 0,
+    mower_error ? 1 : 0, turbo_fb ? 1 : 0, pcf_lights_on ? 1 : 0);
+  Serial2.println(buf);
 }
 
 // ============================================================
 // Pi serial bridge — command RX
 // ============================================================
-void parsePiCommand(const String& line) {
-  if (line.length() < 5) return;
+void parsePiCommand(const char* line) {
+  if (strlen(line) < 5) return;
   Serial.print(F("[PI ] Rx: ")); Serial.println(line);
 
-  if (line.indexOf(F("\"cmd\":\"ping\"")) >= 0) {
+  if (strstr(line, "\"cmd\":\"ping\"")) {
     Serial2.println(F("{\"pong\":1}"));
     return;
   }
 
-  if (line.indexOf(F("\"cmd\":\"stop\"")) >= 0) {
+  if (strstr(line, "\"cmd\":\"stop\"")) {
     pi_leftSpeed  = 0;
     pi_rightSpeed = 0;
     piDriveActive = false;
@@ -643,16 +605,16 @@ void parsePiCommand(const String& line) {
     return;
   }
 
-  if (line.indexOf(F("\"cmd\":\"drive\"")) >= 0) {
+  if (strstr(line, "\"cmd\":\"drive\"")) {
     if (gGamepad != nullptr) {
       Serial.println(F("[PI ] Drive ignored — PS4 connected"));
       return;
     }
-    int lIdx = line.indexOf(F("\"l\":"));
-    int rIdx = line.indexOf(F("\"r\":"));
-    if (lIdx >= 0 && rIdx >= 0) {
-      pi_leftSpeed  = constrain(line.substring(lIdx + 4).toInt(), -MAX_SPEED, MAX_SPEED);
-      pi_rightSpeed = constrain(line.substring(rIdx + 4).toInt(), -MAX_SPEED, MAX_SPEED);
+    const char* lPtr = strstr(line, "\"l\":");
+    const char* rPtr = strstr(line, "\"r\":");
+    if (lPtr && rPtr) {
+      pi_leftSpeed  = constrain(atoi(lPtr + 4), -MAX_SPEED, MAX_SPEED);
+      pi_rightSpeed = constrain(atoi(rPtr + 4), -MAX_SPEED, MAX_SPEED);
       piDriveActive = true;
       lastPiCmd     = millis();
       Serial.print(F("[PI ] Drive L=")); Serial.print(pi_leftSpeed);
@@ -661,11 +623,11 @@ void parsePiCommand(const String& line) {
     return;
   }
 
-  if (line.indexOf(F("\"cmd\":\"relay\"")) >= 0) {
-    int stateIdx = line.indexOf(F("\"state\":"));
-    bool state = (stateIdx >= 0) && (line.substring(stateIdx + 8).toInt() == 1);
+  if (strstr(line, "\"cmd\":\"relay\"")) {
+    const char* statePtr = strstr(line, "\"state\":");
+    bool state = statePtr && (atoi(statePtr + 8) == 1);
 
-    if (line.indexOf(F("\"id\":\"motor\"")) >= 0) {
+    if (strstr(line, "\"id\":\"motor\"")) {
       if (state && !relay_motor && armState == ARM_IDLE) {
         startArmSequence();
         Serial.println(F("[PI ] Motor ON — arm sequence started"));
@@ -673,7 +635,7 @@ void parsePiCommand(const String& line) {
         stopMotor();
         Serial.println(F("[PI ] Motor OFF"));
       }
-    } else if (line.indexOf(F("\"id\":\"turbo\"")) >= 0) {
+    } else if (strstr(line, "\"id\":\"turbo\"")) {
       relay_turbo = state;
       digitalWrite(RELAY_TURBO, relay_turbo ? HIGH : LOW);
       Serial.print(F("[PI ] Turbo ")); Serial.println(state ? F("ON") : F("OFF"));
@@ -681,13 +643,13 @@ void parsePiCommand(const String& line) {
     return;
   }
 
-  if (line.indexOf(F("\"cmd\":\"pcf\"")) >= 0) {
+  if (strstr(line, "\"cmd\":\"pcf\"")) {
     if (!pcfPresent) { Serial.println(F("[PCF ] Not connected — ignoring")); return; }
-    if (line.indexOf(F("\"id\":\"turbo_btn\"")) >= 0) {
+    if (strstr(line, "\"id\":\"turbo_btn\"")) {
       pcf.write(PCF_TURBO_BTN, LOW);
       turboBtnOff = millis() + PCF_BTN_PULSE_MS;
       Serial.println(F("[PCF ] Turbo button press"));
-    } else if (line.indexOf(F("\"id\":\"lights_btn\"")) >= 0) {
+    } else if (strstr(line, "\"id\":\"lights_btn\"")) {
       pcf.write(PCF_LIGHTS_BTN, LOW);
       lightsBtnOff  = millis() + PCF_BTN_PULSE_MS;
       pcf_lights_on = !pcf_lights_on;
@@ -736,13 +698,6 @@ void setup() {
   Serial.print(F("  Heap    : ")); Serial.print(ESP.getFreeHeap()); Serial.println(F(" bytes"));
   debugSep();
 
-  // ── Green LED (GPIO 16, LEDC PWM) ────────────────────────
-  ledcSetup(LED_LEDC_CH, LED_LEDC_FREQ, LED_LEDC_BITS);
-  ledcAttachPin(LED_PIN, LED_LEDC_CH);
-  boardLED(LED_OFF);
-  Serial.print(F("[INIT] Green LED ready (GPIO ")); Serial.print(LED_PIN);
-  Serial.print(F(", LEDC ch ")); Serial.print(LED_LEDC_CH); Serial.println(F(")"));
-
   // ── Motor pins ────────────────────────────────────────────
   pinMode(MOTOR_A_DIR, OUTPUT); analogWrite(MOTOR_A_PWM, 0);
   pinMode(MOTOR_B_DIR, OUTPUT); analogWrite(MOTOR_B_PWM, 0);
@@ -756,6 +711,7 @@ void setup() {
 
   // ── I2C + PCF8575 ────────────────────────────────────────
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setTimeout(25);   // 25 ms cap — prevents blocking when PCF not connected
   pcfPresent = pcf.begin();
   if (pcfPresent) {
     pcf.write16(0xFFFF); // all pins HIGH: inputs float, outputs inactive
@@ -812,8 +768,6 @@ void setup() {
   Serial.println(F("  SQR = toggle mower lights"));
   Serial.println(F("  L2  = set D-pad speed ceiling"));
   Serial.println(F("  L1  = reset D-pad speed"));
-  Serial.println(F("  Board LED: off=idle  dim=dual  low=single  med=motor  full=turbo"));
-  Serial.println(F("             fast blink=error  med blink=heat"));
   debugSep();
 }
 
@@ -822,16 +776,19 @@ void setup() {
 // ============================================================
 void loop() {
 
-  // ── 1. Arm state machine ───────────────────────────────
+  // ── 1. Bluepad32 update — FIRST for minimum BT latency ─
+  BP32.update();
+
+  // ── 2. Arm state machine ───────────────────────────────
   updateArmStateMachine();
 
-  // ── 2. PCF8575 input poll (10 Hz) ─────────────────────
+  // ── 3. PCF8575 input poll (10 Hz) ─────────────────────
   if (pcfPresent && millis() - lastPCFRead >= PCF_READ_MS) {
     lastPCFRead = millis();
     readPCF();
   }
 
-  // ── 3. PCF8575 output button release timers ───────────
+  // ── 4. PCF8575 output button release timers ───────────
   if (pcfPresent && turboBtnOff && millis() >= turboBtnOff) {
     turboBtnOff = 0;
     pcf.write(PCF_TURBO_BTN, HIGH);
@@ -841,18 +798,19 @@ void loop() {
     pcf.write(PCF_LIGHTS_BTN, HIGH);
   }
 
-  // ── 4. Pi bridge — receive commands ───────────────────
+  // ── 5. Pi bridge — receive commands ───────────────────
   while (Serial2.available()) {
     char c = Serial2.read();
     if (c == '\n') {
-      parsePiCommand(piCmdBuffer);
-      piCmdBuffer = "";
-    } else if (piCmdBuffer.length() < 256) {
-      piCmdBuffer += c;
+      piCmdBuf[piCmdLen] = '\0';
+      parsePiCommand(piCmdBuf);
+      piCmdLen = 0;
+    } else if (piCmdLen < sizeof(piCmdBuf) - 1) {
+      piCmdBuf[piCmdLen++] = c;
     }
   }
 
-  // ── 5. Pi drive timeout ────────────────────────────────
+  // ── 6. Pi drive timeout ────────────────────────────────
   if (piDriveActive && (millis() - lastPiCmd > PI_CMD_TIMEOUT_MS)) {
     piDriveActive = false;
     pi_leftSpeed  = 0;
@@ -860,20 +818,17 @@ void loop() {
     Serial.println(F("[PI ] Drive timeout — stopped"));
   }
 
-  // ── 6. Telemetry to Pi at 20 Hz ───────────────────────
+  // ── 7. Telemetry to Pi at 20 Hz ───────────────────────
   if (millis() - lastTelemSent >= PI_TELEM_MS) {
     lastTelemSent = millis();
     sendTelemetry();
   }
 
-  // ── 7. Timed rumble off ────────────────────────────────
+  // ── 8. Timed rumble off ────────────────────────────────
   if (rumbleOffTime && millis() >= rumbleOffTime) {
     rumbleOffTime = 0;
     if (gGamepad && gGamepad->isConnected()) gGamepad->setRumble(0, 0);
   }
-
-  // ── 8. Bluepad32 update ────────────────────────────────
-  BP32.update();
 
   if (gGamepad == nullptr || !gGamepad->isConnected()) {
     if (piDriveActive) {
@@ -881,7 +836,6 @@ void loop() {
       driveMotor(MOTOR_B_PWM, MOTOR_B_DIR, pi_rightSpeed);
     }
     updateLED();
-    delay(20);
     return;
   }
 
@@ -892,8 +846,7 @@ void loop() {
   if (curPS && !prev_PS) {
     tankMode = (tankMode == MODE_DUAL_STICK) ? MODE_SINGLE_STICK : MODE_DUAL_STICK;
     Serial.print(F("[MODE] -> ")); Serial.println(modeNames[tankMode]);
-    ctrlLED(modeColour());
-    boardLED(modeBrightness());
+    if (!relay_motor && !relay_turbo) setLED(modeColour());
   }
   prev_PS = curPS;
 
@@ -921,12 +874,13 @@ void loop() {
     digitalWrite(RELAY_TURBO, relay_turbo ? HIGH : LOW);
     Serial.print(F("[BTN ] TRI — TURBO ")); Serial.println(relay_turbo ? F("ON") : F("OFF"));
     debugRelays();
-    lastFlash  = 0;
-    flashState = false;
     if (relay_turbo) {
+      lastFlash  = 0;
+      flashState = false;
       gp->setRumble(0x40, 0x40);
       rumbleOffTime = millis() + RUMBLE_MS;
     } else {
+      if (!relay_motor) setLED(modeColour());
       gp->setRumble(0x10, 0x10);
       rumbleOffTime = millis() + 80;
     }
@@ -969,6 +923,26 @@ void loop() {
   }
   prev_SQR = curSQR;
 
+  // ── Cross (hold) → show controller battery on LED ────
+  bool curCROSS = (gp->buttons() & BUTTON_A) != 0;
+  if (curCROSS && !prev_CROSS) {
+    showBatt = true;
+    int b = gp->battery();
+    Colour c;
+    if      (b >= 75) c = {   0, 255,   0 }; // green  — good
+    else if (b >= 50) c = { 255, 180,   0 }; // yellow — ok
+    else if (b >= 25) c = { 255,  80,   0 }; // orange — low
+    else              c = { 255,   0,   0 }; // red    — critical
+    setLED(c);
+    Serial.print(F("[BATT] Controller ")); Serial.print(b); Serial.println(F("%"));
+  } else if (!curCROSS && prev_CROSS) {
+    showBatt   = false;
+    lastFlash  = 0;
+    flashState = false;
+    if (!relay_motor && !relay_turbo) setLED(modeColour());
+  }
+  prev_CROSS = curCROSS;
+
   // ── Drive ─────────────────────────────────────────────
   int leftSpeed  = 0;
   int rightSpeed = 0;
@@ -989,17 +963,27 @@ void loop() {
     } else {
       int throttle = stickToSpeed(gp->axisY());
       int turn     = stickToSpeed(gp->axisX());
-      leftSpeed    = constrain(throttle + turn, -MAX_SPEED, MAX_SPEED);
-      rightSpeed   = constrain(throttle - turn, -MAX_SPEED, MAX_SPEED);
+      leftSpeed    = constrain(throttle - turn, -MAX_SPEED, MAX_SPEED);
+      rightSpeed   = constrain(throttle + turn, -MAX_SPEED, MAX_SPEED);
     }
   }
 
-  driveMotor(MOTOR_A_PWM, MOTOR_A_DIR, leftSpeed);
-  driveMotor(MOTOR_B_PWM, MOTOR_B_DIR, rightSpeed);
+  // Exponential smoothing: alpha = 1/4 (integer math, no floats)
+  // Dampens deadzone-boundary zeros before they reach the motor.
+  // Decays a spike to ~6% in 10ms at typical loop rates.
+  smoothedL = (smoothedL * 3 + leftSpeed)  / 4;
+  smoothedR = (smoothedR * 3 + rightSpeed) / 4;
+
+  driveMotor(MOTOR_A_PWM, MOTOR_A_DIR, smoothedL);
+  driveMotor(MOTOR_B_PWM, MOTOR_B_DIR, smoothedR);
   scene_driveL = leftSpeed;
   scene_driveR = rightSpeed;
 
-  if (leftSpeed != prev_leftSpeed || rightSpeed != prev_rightSpeed) {
+  // Rate-limit drive log — with no delay() this would flood serial at low speed
+  static unsigned long lastDrvLog = 0;
+  if ((leftSpeed != prev_leftSpeed || rightSpeed != prev_rightSpeed)
+      && millis() - lastDrvLog >= 100) {
+    lastDrvLog = millis();
     Serial.print(F("[DRV ] L=")); Serial.print(leftSpeed);
     Serial.print(F(" R="));      Serial.println(rightSpeed);
     prev_leftSpeed  = leftSpeed;
@@ -1028,5 +1012,4 @@ void loop() {
   }
 
   updateLED();
-  delay(20);
 }

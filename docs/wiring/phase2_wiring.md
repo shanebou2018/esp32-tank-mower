@@ -34,15 +34,18 @@ The DIR pin on the AS5600 sets rotation direction — tie HIGH or LOW to match y
 
 ---
 
-## ESP32 → Cytron MD13S (unchanged from Phase 1)
+## ESP32 → Cytron MDDS30 (dual-channel, replaces 2× MD13S)
 
-| ESP32 Pin | MD13S | Track |
-|-----------|-------|-------|
-| 25 | PWM | Left |
-| 26 | DIR | Left |
-| 27 | PWM | Right |
-| 14 | DIR | Right |
+| ESP32 Pin | MDDS30 | Track |
+|-----------|--------|-------|
+| 25 | PWM1 | Left |
+| 26 | DIR1 | Left |
+| 27 | PWM2 | Right |
+| 14 | DIR2 | Right |
 | GND | GND | Both |
+
+> Do NOT power the ESP32s from the MDDS30 5V pin — rail sags under BT TX peaks
+> causing BT throttling/resets. Use a dedicated 5V supply for the ESP32s.
 
 ---
 
@@ -70,8 +73,8 @@ The DIR pin on the AS5600 sets rotation direction — tie HIGH or LOW to match y
 
 ## Power
 
-- ESP32: 5V via USB or battery regulator
-- MD13S: main drive battery (match motor voltage)
+- ESP32 (both): dedicated 5V supply (NOT from MDDS30) — MDDS30 rail sags under BT TX peaks
+- MDDS30: main drive battery (7V–35V)
 - Relay coils: 5V — use relay modules with onboard optocouplers
 - AS5600 encoders: 3.3V from ESP32
 - Raspberry Pi: 5V / 3A dedicated supply (USB-C on Pi 4/5)
