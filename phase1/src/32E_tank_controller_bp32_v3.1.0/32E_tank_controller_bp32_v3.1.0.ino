@@ -139,12 +139,28 @@ enum MowerScene {
 // ── Tuning ───────────────────────────────────────────────────
 #define DEADZONE        20
 #define MAX_SPEED       100     // Cytron SmartDriveDuo serial simplified range is -100..+100
-#define MIN_MOTOR_SPEED 0      // MDDS30 minimum effective duty — below this the driver stalls
+#define MIN_MOTOR_SPEED 0       // Minimum output sent to MDDS30 for any non-zero input.
+                                // Set to the lowest speed at which your motors reliably spin
+                                // (e.g. 15).  0 = no floor — scaleToMotor is a straight ramp.
 #define STICK_MAX       511
-#define DPAD_SPEED_MIN  0      // D-pad min matches motor floor
+#define DPAD_SPEED_MIN  0       // D-pad min matches motor floor
 #define ARM_PULSE_MS    500
 #define RUMBLE_MS       300
 #define STATUS_INTERVAL_MS 2000
+
+// ── Stick curve ───────────────────────────────────────────────
+// Blend between pure cubic (1.0) and pure linear (0.0).
+//   1.0 = maximum expo: very slow near centre, snappy at edges
+//   0.0 = linear:       direct 1:1 stick-to-speed
+//   0.25 = light expo:  decisive response, still controllable at low speed
+// Change this one number to retune — do NOT change stickToSpeed().
+#define EXPO_BLEND      0.25f
+
+// ── Motor direction ───────────────────────────────────────────
+// Set to +1 (normal) or -1 (reverse) for each motor.
+// Flip here instead of rewiring.  All drive math stays positive=forward.
+#define MOTOR_L_DIR     (+1)
+#define MOTOR_R_DIR     (+1)
 
 // ── Types ─────────────────────────────────────────────────────
 enum TankMode  { MODE_DUAL_STICK, MODE_SINGLE_STICK };
@@ -210,8 +226,10 @@ struct IO2Ctrl {
 //   Motor L fwd: 0x00 | map(spd,  0,100, 0,63)   rev: 0x40 | map(|spd|,  0,100, 0,63)
 //   Motor R fwd: 0xC0 | map(spd,  0,100, 0,63)   rev: 0x80 | map(|spd|,  0,100, 0,63)
 inline void sendMotorBytes(int leftSpd, int rightSpd) {
-  leftSpd  = constrain(leftSpd,  -100, 100);
-  rightSpd = constrain(rightSpd, -100, 100);
+  // Apply per-motor direction correction before encoding.
+  // Flip MOTOR_L_DIR / MOTOR_R_DIR in the defines to reverse a motor without rewiring.
+  leftSpd  = constrain(leftSpd  * MOTOR_L_DIR, -100, 100);
+  rightSpd = constrain(rightSpd * MOTOR_R_DIR, -100, 100);
   uint8_t lByte = (leftSpd  >= 0)
     ? (uint8_t)(0x00 | map( leftSpd, 0, 100, 0, 63))
     : (uint8_t)(0x40 | map(-leftSpd, 0, 100, 0, 63));
@@ -349,11 +367,15 @@ void updateLED(bool motor, bool turbo) {
   }
 }
 
+// Converts a raw PS4 axis value (-511..+511) to a motor speed (-100..+100).
+// PS4 Y-axes are negative-up, so val = -axis to make "up" produce positive speed.
+// For X-axis (single-stick turn), pass -axisX() at the call site so rightward
+// push produces a positive turn value (left wheel faster = robot turns right).
 int stickToSpeed(int axis) {
   int val = -axis;
   if (abs(val) <= DEADZONE) return 0;
   float norm   = (float)val / (float)STICK_MAX;
-  float curved = (norm * norm * norm * 0.85f) + (norm * 0.15f);
+  float curved = (norm * norm * norm * EXPO_BLEND) + (norm * (1.0f - EXPO_BLEND));
   curved = constrain(curved, -1.0f, 1.0f);
   return (int)(curved * MAX_SPEED);
 }
@@ -366,9 +388,10 @@ int calcDpadSpeed(int rawL2) {
 // Rescales any non-zero speed into MIN_MOTOR_SPEED..MAX_SPEED so
 // the MDDS30 always receives a duty cycle it can act on.
 // Zero passes through unchanged — motor stops cleanly.
+// NOTE: map from 0 (not 1) so speed=1 produces MIN_MOTOR_SPEED, not 0.
 int scaleToMotor(int speed) {
   if (speed == 0) return 0;
-  int mag = (int)map(abs(speed), 1, MAX_SPEED, MIN_MOTOR_SPEED, MAX_SPEED);
+  int mag = (int)map(abs(speed), 0, MAX_SPEED, MIN_MOTOR_SPEED, MAX_SPEED);
   return (speed > 0) ? mag : -mag;
 }
 
@@ -1099,7 +1122,10 @@ void loop() {
       rightSpeed = stickToSpeed(gp->axisRY());
     } else {
       int throttle = stickToSpeed(gp->axisY());
-      int turn     = stickToSpeed(gp->axisX());
+      // axisX is positive-right on PS4.  stickToSpeed() negates its input,
+      // so passing axisX directly would make right-push = negative turn,
+      // meaning rightSpeed > leftSpeed = robot turns LEFT.  Pre-negate to fix.
+      int turn     = stickToSpeed(-gp->axisX());
       leftSpeed    = constrain(throttle + turn, -MAX_SPEED, MAX_SPEED);
       rightSpeed   = constrain(throttle - turn, -MAX_SPEED, MAX_SPEED);
     }
