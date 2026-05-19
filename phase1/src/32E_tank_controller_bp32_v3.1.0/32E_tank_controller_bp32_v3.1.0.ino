@@ -20,6 +20,29 @@
 //     self-terminating; no manual stop needed
 //   - Drive smoothing filter removed -- added lag with no
 //     benefit for MDDS30 direct-drive
+//   - Switched to Cytron SmartDriveDuo Serial Simplified protocol
+//     implemented directly on Serial2 (hardware UART GPIO 25)
+//     avoids SoftwareSerial incompatibility on ESP32
+//   - Motor output: PWM_DIR → Serial Simplified (1 wire, GPIO 25)
+//     GPIO 25 → MDDS30 IN1 (serial RX). AN1/AN2/IN2 unused.
+//     Motor commands throttled to 20 Hz to stay within baud budget
+//     Pi bridge moved to Serial1 (shared with Pip-Boy via GPIO matrix)
+//     Serial2 exclusively owns MDDS30 motor serial
+//   - Serial.setTxBufferSize(1024) — async UART TX so debugFullStatus()
+//     (~700 bytes every 2s) never blocks loop() / BP32.update()
+//     (default tx_buffer_size=0 = synchronous writes = ~61ms stall)
+//   - esp_wifi_stop() after BP32.setup() — WiFi shares the 2.4GHz radio;
+//     stopping it eliminates coexistence jitter and improves range
+//   - esp_bredr_tx_power_set(P9,P9) — Classic BT TX raised +3dBm→+9dBm
+//   - vTaskDelay(1) at end of loop() — yields to btstack service tasks
+//
+// MDDS30 DIP switches (your current: 11001111)
+//   SW1=ON  SW2=ON  → Serial mode
+//   SW3=OFF          → Serial Simplified
+//   SW4=OFF SW5=ON  → "Independent Right" only ← CHANGE to SW4=ON SW5=ON ("Independent Both")
+//   SW6=ON  SW7=ON  SW8=ON → 115200 baud ✓
+//   Correct setting: 11011111
+//   Connect: GPIO 25 → MDDS30 IN1 only. Disconnect AN1/AN2/IN2.
 //
 // v3.0.0 changes (FreeRTOS split, PCF8575, Pip-Boy):
 //   see v3.0.0 header.
@@ -31,12 +54,16 @@
 #include <EncAS5600.h>
 #include <Wire.h>
 #include <PCF8575.h>
+#include "rom/gpio.h"   // gpio_matrix_out() — ROM fn, no macro conflicts
+#include <esp_wifi.h>   // esp_wifi_stop() — silence the shared 2.4GHz radio
+#include <esp_bt.h>     // esp_bredr_tx_power_set() — Classic BT TX power
+// U1TXD_OUT_IDX = 23 on all original ESP32 silicon.
 
 // ── Pin definitions ───────────────────────────────────────────
-#define MOTOR_A_PWM    25
-#define MOTOR_A_DIR    26
-#define MOTOR_B_PWM    27
-#define MOTOR_B_DIR    14
+// Motor serial: GPIO 25 → MDDS30 IN1 (TX-only, Serial Simplified).
+// GPIO 26, 27, 14 (former PWM/DIR) unused — disconnect from MDDS30.
+#define MDDS30_TX_PIN  25
+#define MDDS30_BAUD    115200   // DIP SW6-8=111 → 115200 baud
 
 #define RELAY_ARM      32
 #define RELAY_MOTOR    33
@@ -73,9 +100,14 @@ bool    pcfPresent = false;
 #define PCF_READ_MS      100
 #define PCF_BTN_PULSE_MS 200
 
-// ── Serial1 — Pip-Boy link ────────────────────────────────────
-#define ESP2_SERIAL_TX  4
-#define ESP2_SERIAL_RX  5
+// ── Serial1 — Pi bridge + Pip-Boy display (shared via GPIO matrix) ──
+// UART1 TX primary pin: GPIO 17 → Pi RX.   UART1 RX: GPIO 13 ← Pi TX.
+// gpio_matrix_out() in setup() also routes UART1 TX to GPIO 4 (Pip-Boy).
+// Both Pi and Pip-Boy receive every Serial1 line.
+//   Pi firmware  : parse telemetry JSON, ignore {"s":…} scene lines.
+//   Pip-Boy fw   : parse {"s":…} scene lines, ignore telemetry lines.
+#define ESP2_SERIAL_TX  4       // Pip-Boy RX — routed from UART1 TX via GPIO matrix
+#define ESP2_SERIAL_RX  5       // (reserved, not currently used)
 #define ESP2_BAUD       115200
 
 // ── Pip-Boy scene engine ──────────────────────────────────────
@@ -93,10 +125,10 @@ enum MowerScene {
 #define PIPBOY_INTERVAL_MS 500
 
 // ── Pi serial bridge ──────────────────────────────────────────
-#define PI_SERIAL_TX       17
-#define PI_SERIAL_RX       13
-#define PI_BAUD            115200
-#define PI_TELEM_MS        50
+#define PI_SERIAL_TX    17      // UART1 TX primary pin → Pi RX
+#define PI_SERIAL_RX    13      // UART1 RX ← Pi TX
+#define PI_BAUD         115200
+#define PI_TELEM_MS     50
 #define PI_CMD_TIMEOUT_MS  500
 
 // ── Odometry ─────────────────────────────────────────────────
@@ -105,10 +137,11 @@ enum MowerScene {
 #define DIST_PER_DEG_M    (3.14159265f * WHEEL_DIAMETER_M / (GEAR_RATIO * 360.0f))
 
 // ── Tuning ───────────────────────────────────────────────────
-#define DEADZONE        6
-#define MAX_SPEED       127     // 50% PWM ceiling — prevents 5V sag under BT TX peaks
+#define DEADZONE        20
+#define MAX_SPEED       100     // Cytron SmartDriveDuo serial simplified range is -100..+100
+#define MIN_MOTOR_SPEED 0      // MDDS30 minimum effective duty — below this the driver stalls
 #define STICK_MAX       511
-#define DPAD_SPEED_MIN  15
+#define DPAD_SPEED_MIN  0      // D-pad min matches motor floor
 #define ARM_PULSE_MS    500
 #define RUMBLE_MS       300
 #define STATUS_INTERVAL_MS 2000
@@ -168,6 +201,26 @@ struct IO2Ctrl {
   bool req_lights_btn;
   bool req_rumble;
 };
+
+// ── Motor serial output ───────────────────────────────────────
+// Cytron SmartDriveDuo Serial Simplified protocol, implemented directly
+// on Serial2 (hardware UART) — the Cytron library uses SoftwareSerial
+// which does not compile on ESP32.
+// Speed range -100..+100.  Two bytes per command: L byte then R byte.
+//   Motor L fwd: 0x00 | map(spd,  0,100, 0,63)   rev: 0x40 | map(|spd|,  0,100, 0,63)
+//   Motor R fwd: 0xC0 | map(spd,  0,100, 0,63)   rev: 0x80 | map(|spd|,  0,100, 0,63)
+inline void sendMotorBytes(int leftSpd, int rightSpd) {
+  leftSpd  = constrain(leftSpd,  -100, 100);
+  rightSpd = constrain(rightSpd, -100, 100);
+  uint8_t lByte = (leftSpd  >= 0)
+    ? (uint8_t)(0x00 | map( leftSpd, 0, 100, 0, 63))
+    : (uint8_t)(0x40 | map(-leftSpd, 0, 100, 0, 63));
+  uint8_t rByte = (rightSpd >= 0)
+    ? (uint8_t)(0xC0 | map( rightSpd, 0, 100, 0, 63))
+    : (uint8_t)(0x80 | map(-rightSpd, 0, 100, 0, 63));
+  Serial2.write(lByte);
+  Serial2.write(rByte);
+}
 
 static SemaphoreHandle_t g_mutex_c2i;
 static SemaphoreHandle_t g_mutex_i2c;
@@ -296,29 +349,11 @@ void updateLED(bool motor, bool turbo) {
   }
 }
 
-// ============================================================
-// Motor drive — Core 1 only
-// ============================================================
-void driveMotor(uint8_t pwmPin, uint8_t dirPin, int speed) {
-  static bool lastDirA = true;
-  static bool lastDirB = true;
-  bool& lastDir = (pwmPin == MOTOR_A_PWM) ? lastDirA : lastDirB;
-
-  speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
-  bool newDir = (speed >= 0);
-  if (newDir != lastDir) {
-    analogWrite(pwmPin, 0);  // coast briefly on direction reversal
-  }
-  lastDir = newDir;
-  digitalWrite(dirPin, newDir ? HIGH : LOW);
-  analogWrite(pwmPin, abs(speed));
-}
-
 int stickToSpeed(int axis) {
   int val = -axis;
   if (abs(val) <= DEADZONE) return 0;
   float norm   = (float)val / (float)STICK_MAX;
-  float curved = (norm * norm * norm * 0.4f) + (norm * 0.6f);
+  float curved = (norm * norm * norm * 0.85f) + (norm * 0.15f);
   curved = constrain(curved, -1.0f, 1.0f);
   return (int)(curved * MAX_SPEED);
 }
@@ -326,6 +361,15 @@ int stickToSpeed(int axis) {
 int calcDpadSpeed(int rawL2) {
   if (rawL2 <= 0) return 0;
   return (int)map(rawL2, 0, 1023, DPAD_SPEED_MIN, MAX_SPEED);
+}
+
+// Rescales any non-zero speed into MIN_MOTOR_SPEED..MAX_SPEED so
+// the MDDS30 always receives a duty cycle it can act on.
+// Zero passes through unchanged — motor stops cleanly.
+int scaleToMotor(int speed) {
+  if (speed == 0) return 0;
+  int mag = (int)map(abs(speed), 1, MAX_SPEED, MIN_MOTOR_SPEED, MAX_SPEED);
+  return (speed > 0) ? mag : -mag;
 }
 
 // ============================================================
@@ -382,8 +426,7 @@ void onDisconnectedGamepad(GamepadPtr gp) {
   debugBanner("CONTROLLER DISCONNECTED — FAILSAFE");
   gGamepad = nullptr;
 
-  analogWrite(MOTOR_A_PWM, 0);
-  analogWrite(MOTOR_B_PWM, 0);
+  sendMotorBytes(0, 0);
   digitalWrite(RELAY_ARM,   LOW);
   digitalWrite(RELAY_MOTOR, LOW);
   digitalWrite(RELAY_TURBO, LOW);
@@ -481,7 +524,7 @@ static void ioParsePiCommand(const char* line, bool& piDriveActive,
   if (strlen(line) < 5) return;
 
   if (strstr(line, "\"cmd\":\"ping\"")) {
-    Serial2.println(F("{\"pong\":1}"));
+    Serial1.println(F("{\"pong\":1}"));
     return;
   }
 
@@ -588,13 +631,13 @@ static void ioSendTelemetry(const Ctrl2IO& c, const IO2Ctrl& io) {
     ",\"mower_err\":%d,\"turbo_fb\":%d,\"lights\":%d}",
     c.enc_ticks_L, c.enc_ticks_R,
     c.enc_dist_L, c.enc_dist_R,
-    c.enc_spd_L, c.enc_spd_R,    // from Ctrl2IO snapshot — no cross-core call
+    c.enc_spd_L, c.enc_spd_R,
     digitalRead(RELAY_ARM), c.relay_motor ? 1 : 0, c.relay_turbo ? 1 : 0,
     c.connected ? 1 : 0, modeNames[c.tankMode], c.batt,
     io.bat1_level, io.bat1_heat ? 1 : 0,
     io.bat2_level, io.bat2_heat ? 1 : 0,
     io.mower_error ? 1 : 0, io.turbo_fb ? 1 : 0, io.pcf_lights_on ? 1 : 0);
-  Serial2.println(buf);
+  Serial1.println(buf);   // Serial1 → Pi (GPIO 17) + Pip-Boy (GPIO 4 via GPIO matrix)
 }
 
 // ============================================================
@@ -666,9 +709,9 @@ static void ioTask(void*) {
       }
     }
 
-    // ── Pi bridge — receive commands ─────────────────────
-    while (Serial2.available()) {
-      char c = Serial2.read();
+    // ── Pi bridge — receive commands (Serial1 RX, GPIO 13) ──────
+    while (Serial1.available()) {
+      char c = Serial1.read();
       if (c == '\n') {
         piCmdBuf[piCmdLen] = '\0';
         ioParsePiCommand(piCmdBuf, piDriveActive, pi_leftSpeed,
@@ -740,19 +783,18 @@ static void ioTask(void*) {
 // setup()
 // ============================================================
 void setup() {
-  // ── Drive all outputs LOW before anything else ────────
-  // Must be first — prevents MDDS30 seeing spurious PWM/DIR
-  // signals during the Serial.begin + delay(400) init window.
-  // PWM pins need explicit pinMode+digitalWrite before analogWrite
-  // attaches LEDC, otherwise the pin floats until LEDC takes over.
-  pinMode(MOTOR_A_PWM, OUTPUT); digitalWrite(MOTOR_A_PWM, LOW);
-  pinMode(MOTOR_A_DIR, OUTPUT); digitalWrite(MOTOR_A_DIR, LOW);
-  pinMode(MOTOR_B_PWM, OUTPUT); digitalWrite(MOTOR_B_PWM, LOW);
-  pinMode(MOTOR_B_DIR, OUTPUT); digitalWrite(MOTOR_B_DIR, LOW);
+  // ── Drive relay outputs LOW before anything else ─────
+  // Motor serial (GPIO 25) is initialised below with Serial2.begin().
   pinMode(RELAY_ARM,   OUTPUT); digitalWrite(RELAY_ARM,   LOW);
   pinMode(RELAY_MOTOR, OUTPUT); digitalWrite(RELAY_MOTOR, LOW);
   pinMode(RELAY_TURBO, OUTPUT); digitalWrite(RELAY_TURBO, LOW);
 
+  // Async TX buffer MUST be set before begin().
+  // Default tx_buffer_size=0 → synchronous writes → debugFullStatus()
+  // blocks loop() for ~61ms at 115200 baud (700 bytes / 11520 Bps).
+  // BP32.update() must fire every <10ms to keep the DS4 alive;
+  // a 61ms gap is enough to trigger controller disconnect.
+  Serial.setTxBufferSize(1024);
   Serial.begin(115200);
   delay(400);
   debugBanner("ESP32-DevKitC-32E TANK MOWER — PHASE 2 v3.1.0");
@@ -761,12 +803,16 @@ void setup() {
   Serial.print(F("  Heap    : ")); Serial.print(ESP.getFreeHeap()); Serial.println(F(" bytes"));
   debugSep();
 
-  // ── Motor pins — attach LEDC (pins already LOW) ──────
-  analogWrite(MOTOR_A_PWM, 0);
-  analogWrite(MOTOR_B_PWM, 0);
-  Serial.println(F("[INIT] Motor pins OK"));
+  // ── MDDS30 motor serial — Serial2, TX-only on GPIO 25 ────
+  Serial2.begin(MDDS30_BAUD, SERIAL_8N1, -1, MDDS30_TX_PIN);
+  sendMotorBytes(0, 0);  // explicit stop on boot
+  Serial.println(F("[INIT] MDDS30 serial OK (SmartDriveDuo Simplified)"));
+  Serial.print(F("  TX=GPIO")); Serial.print(MDDS30_TX_PIN);
+  Serial.print(F("  Baud=")); Serial.println(MDDS30_BAUD);
+  Serial.println(F("  L: Motor1/ChA  R: Motor2/ChB  (GPIO25 → IN1)"));
+  Serial.println(F("  Pi bridge on Serial1 (GPIO17 TX / GPIO13 RX)"));
 
-  // ── Relay pins — already LOW, confirm ────────────────
+  // ── Relay pins — already LOW ──────────────────────────
   Serial.println(F("[INIT] Relay pins OK (all LOW)"));
 
   // ── I2C + PCF8575 — init here, then owned by Core 0 ──
@@ -805,13 +851,17 @@ void setup() {
   Serial.println(F("[INIT] AS5600 encoders started"));
   Serial.print(F("  Dist/deg = ")); Serial.print(DIST_PER_DEG_M * 1000.0f, 4); Serial.println(F("mm"));
 
-  // ── Serial1 — Pip-Boy TX (IO task owns after setup) ──
-  Serial1.begin(ESP2_BAUD, SERIAL_8N1, ESP2_SERIAL_RX, ESP2_SERIAL_TX);
-  Serial.println(F("[INIT] Serial1 (Pip-Boy TX) started"));
+  // ── Serial1 — Pi bridge + Pip-Boy (shared UART, GPIO matrix) ─
+  // TX primary → GPIO 17 (Pi RX).  RX ← GPIO 13 (Pi TX).
+  // GPIO matrix additionally routes UART1 TX to GPIO 4 (Pip-Boy RX).
+  Serial1.begin(PI_BAUD, SERIAL_8N1, PI_SERIAL_RX, PI_SERIAL_TX);
+  // Route UART1 TX additionally to Pip-Boy pin via GPIO matrix.
+  // gpio_matrix_out() declared via rom/gpio.h — no extern "C" needed here.
+  gpio_matrix_out(ESP2_SERIAL_TX, 23u, false, false); // 23 = U1TXD_OUT_IDX
+  Serial.println(F("[INIT] Serial1: Pi bridge TX=GPIO17 RX=GPIO13 @ 115200"));
+  Serial.println(F("         Pip-Boy GPIO4 also receives via GPIO matrix"));
 
-  // ── Pi serial bridge (IO task owns after setup) ───────
-  Serial2.begin(PI_BAUD, SERIAL_8N1, PI_SERIAL_RX, PI_SERIAL_TX);
-  Serial.println(F("[INIT] Pi serial bridge (Serial2) started"));
+  // (Pi bridge is on Serial1 above — Serial2 is MDDS30 motor serial)
 
   // ── RTOS mutexes ──────────────────────────────────────
   g_mutex_c2i = xSemaphoreCreateMutex();
@@ -827,7 +877,19 @@ void setup() {
   // ── Bluepad32 ─────────────────────────────────────────
   BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
 
+  // ── BT RF optimisations ───────────────────────────────
+  // WiFi and Classic BT share one 2.4GHz radio on ESP32.
+  // Even without WiFi.begin(), the coexistence controller
+  // can steal BT air time.  Stop it explicitly.
+  esp_wifi_stop();   // harmless if WiFi never started
+
+  // PS4 uses BR/EDR (Classic BT).  Default TX power is +3dBm.
+  // Raise both min and max to +9dBm for full range.
+  esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
+
   debugSep();
+  Serial.println(F("[BT ] WiFi radio stopped"));
+  Serial.println(F("[BT ] Classic BT TX power: +9dBm"));
   Serial.println(F("[BT ] Ready — hold PS to pair"));
   Serial.println(F("  PS    = toggle mode  (LED: blue=dual / green=single)"));
   Serial.println(F("  R1    = arm -> latch mower  (again to stop)"));
@@ -843,6 +905,12 @@ void setup() {
 // loop() — Core 1 (BT/motor hot path)
 // ============================================================
 void loop() {
+  // ── Serial motor throttle state ───────────────────────
+  // 115200 baud = ~11520 bytes/sec. Two motors × 1 byte = 2 bytes/cmd.
+  // Cap at 20 Hz keepalive; fire immediately on any speed change.
+  static int           sentL       = 9999;
+  static int           sentR       = 9999;
+  static unsigned long lastMotorMs = 0;
 
   // ── 1. BP32 update — first for minimum BT latency ────
   BP32.update();
@@ -895,13 +963,19 @@ void loop() {
   // ── 6. Autonomous drive (no controller) ──────────────
   if (gGamepad == nullptr || !gGamepad->isConnected()) {
     if (piDriveActive) {
-      driveMotor(MOTOR_A_PWM, MOTOR_A_DIR, io.pi_leftSpeed);
-      driveMotor(MOTOR_B_PWM, MOTOR_B_DIR, io.pi_rightSpeed);
+      int scaledL = scaleToMotor(io.pi_leftSpeed);
+      int scaledR = scaleToMotor(io.pi_rightSpeed);
+      unsigned long nowM = millis();
+      if (scaledL != sentL || scaledR != sentR || nowM - lastMotorMs >= 50) {
+        sendMotorBytes(scaledL, scaledR);
+        sentL = scaledL; sentR = scaledR; lastMotorMs = nowM;
+      }
     }
     int fakeL = piDriveActive ? io.pi_leftSpeed : 0;
     int fakeR = piDriveActive ? io.pi_rightSpeed : 0;
     publishCtrl2IO(fakeL, fakeR, piDriveActive);
     updateLED(relay_motor, relay_turbo);
+    vTaskDelay(1);
     return;
   }
 
@@ -1031,8 +1105,15 @@ void loop() {
     }
   }
 
-  driveMotor(MOTOR_A_PWM, MOTOR_A_DIR, leftSpeed);
-  driveMotor(MOTOR_B_PWM, MOTOR_B_DIR, rightSpeed);
+  {
+    int scaledL = scaleToMotor(leftSpeed);
+    int scaledR = scaleToMotor(rightSpeed);
+    unsigned long nowM = millis();
+    if (scaledL != sentL || scaledR != sentR || nowM - lastMotorMs >= 50) {
+      sendMotorBytes(scaledL, scaledR);
+      sentL = scaledL; sentR = scaledR; lastMotorMs = nowM;
+    }
+  }
 
   static unsigned long lastDrvLog = 0;
   if ((leftSpeed != prev_leftSpeed || rightSpeed != prev_rightSpeed)
@@ -1064,4 +1145,10 @@ void loop() {
   publishCtrl2IO(leftSpeed, rightSpeed, piDriveActive);
 
   updateLED(relay_motor, relay_turbo);
+
+  // Yield 1 FreeRTOS tick so any btstack service tasks pinned
+  // to Core 1 can run between loop iterations.  No measurable
+  // impact on motor/BT latency — motor is throttled to 20 Hz
+  // and BP32.update() is called at the top of every iteration.
+  vTaskDelay(1);
 }
