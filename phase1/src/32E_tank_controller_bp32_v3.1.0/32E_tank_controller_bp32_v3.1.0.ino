@@ -740,6 +740,19 @@ static void ioTask(void*) {
 // setup()
 // ============================================================
 void setup() {
+  // ── Drive all outputs LOW before anything else ────────
+  // Must be first — prevents MDDS30 seeing spurious PWM/DIR
+  // signals during the Serial.begin + delay(400) init window.
+  // PWM pins need explicit pinMode+digitalWrite before analogWrite
+  // attaches LEDC, otherwise the pin floats until LEDC takes over.
+  pinMode(MOTOR_A_PWM, OUTPUT); digitalWrite(MOTOR_A_PWM, LOW);
+  pinMode(MOTOR_A_DIR, OUTPUT); digitalWrite(MOTOR_A_DIR, LOW);
+  pinMode(MOTOR_B_PWM, OUTPUT); digitalWrite(MOTOR_B_PWM, LOW);
+  pinMode(MOTOR_B_DIR, OUTPUT); digitalWrite(MOTOR_B_DIR, LOW);
+  pinMode(RELAY_ARM,   OUTPUT); digitalWrite(RELAY_ARM,   LOW);
+  pinMode(RELAY_MOTOR, OUTPUT); digitalWrite(RELAY_MOTOR, LOW);
+  pinMode(RELAY_TURBO, OUTPUT); digitalWrite(RELAY_TURBO, LOW);
+
   Serial.begin(115200);
   delay(400);
   debugBanner("ESP32-DevKitC-32E TANK MOWER — PHASE 2 v3.1.0");
@@ -748,15 +761,12 @@ void setup() {
   Serial.print(F("  Heap    : ")); Serial.print(ESP.getFreeHeap()); Serial.println(F(" bytes"));
   debugSep();
 
-  // ── Motor pins ────────────────────────────────────────
-  pinMode(MOTOR_A_DIR, OUTPUT); analogWrite(MOTOR_A_PWM, 0);
-  pinMode(MOTOR_B_DIR, OUTPUT); analogWrite(MOTOR_B_PWM, 0);
+  // ── Motor pins — attach LEDC (pins already LOW) ──────
+  analogWrite(MOTOR_A_PWM, 0);
+  analogWrite(MOTOR_B_PWM, 0);
   Serial.println(F("[INIT] Motor pins OK"));
 
-  // ── Relay pins — all LOW on boot ─────────────────────
-  pinMode(RELAY_ARM,   OUTPUT); digitalWrite(RELAY_ARM,   LOW);
-  pinMode(RELAY_MOTOR, OUTPUT); digitalWrite(RELAY_MOTOR, LOW);
-  pinMode(RELAY_TURBO, OUTPUT); digitalWrite(RELAY_TURBO, LOW);
+  // ── Relay pins — already LOW, confirm ────────────────
   Serial.println(F("[INIT] Relay pins OK (all LOW)"));
 
   // ── I2C + PCF8575 — init here, then owned by Core 0 ──
