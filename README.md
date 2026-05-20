@@ -45,7 +45,7 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
 |-----------|---------|
 | Microcontroller | ESP32 (any standard dev board) |
 | Controller | Sony PS4 DualShock 4 |
-| Motor drivers | 2x Cytron MD13S 13A DC Motor Driver |
+| Motor drivers | MDDS30 30A DC Motor Driver |
 | Relay — Arm | Pin 32 — safety interlock, momentary during start |
 | Relay — Motor | Pin 33 — latching mower blade relay |
 | Relay — Turbo | Pin 15 — latching turbo relay |
