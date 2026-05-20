@@ -24,10 +24,11 @@ The Arduino IDE auto-prototype scanner inserts generated function prototypes aft
 
 | Peripheral | Connection |
 |---|---|
+| ESP32 module | **WROOM-32UE** (DevKitC-32UE) — U.FL external antenna |
 | Cytron MDDS30 dual motor driver | GPIO 25 → IN1 (Serial Simplified, TX-only) |
 | Relay ARM | GPIO 32 (momentary pulse) |
 | Relay MOTOR (blade) | GPIO 33 (latching) |
-| Relay TURBO | GPIO 15 (latching) |
+| Relay TURBO | GPIO 27 (latching) — moved from GPIO 15 (strapping pin violation) |
 | AS5600 encoders ×2 | GPIO 34 (L), GPIO 35 (R) — PWM mode, input-only |
 | PCF8575 I/O expander | I2C 0x20, SDA=21, SCL=22 (optional — guarded by `pcfPresent`) |
 | Pi 5 bridge | UART1 TX=GPIO17, RX=GPIO13 @ 115200 |
@@ -35,6 +36,8 @@ The Arduino IDE auto-prototype scanner inserts generated function prototypes aft
 | PS4 DualShock4 | Bluepad32 Classic BT (BR/EDR) |
 
 **Power:** ESP32 on its own 5V supply — NOT the MDDS30 5V pin. That rail sags under BT TX peaks and causes BT dropouts.
+
+**Antenna:** External U.FL antenna (WROOM-32UE) — much better range than PCB-antenna WROOM-32E. Keep the antenna away from metal and route it as far from the MDDS30 / motor wiring as practical.
 
 **MDDS30 DIP switches must be `11011111`:**
 - SW1=ON SW2=ON → Serial mode

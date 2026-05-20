@@ -1,5 +1,9 @@
 # ESP32 Tank Mower — Claude context
 
+## Board
+**ESP32-DevKitC-32UE** (WROOM-32UE module, external U.FL antenna).
+Pinout constraints are identical to WROOM-32E.
+
 ## Active firmware
 `phase1/src/32E_tank_controller_bp32_v3.2.0/`
 
@@ -79,3 +83,18 @@ any type or variable `Coll`.
 - [ ] Test motor directions — `MOTOR_L_DIR` / `MOTOR_R_DIR` currently both +1
 - [ ] Measure MDDS30 stall threshold → set `MIN_MOTOR_SPEED` (try 15)
 - [ ] ESP32s must be on their own 5V supply, NOT the MDDS30 5V pin (sags under BT TX)
+- [ ] External U.FL antenna routed away from MDDS30 / motor wiring
+
+## BT escalation path (user-decided)
+
+If BT is still unsatisfactory, the agreed order of attack:
+1. **External U.FL antenna** (WROOM-32UE) — DONE on new board, this is the first test
+2. **One more firmware pass** — Bluepad32 v4.2.1 upgrade, sniff-mode disable, RX-timeout
+   motor stop, allowlist API, drop Serial.print volume on hot path
+3. **Dedicated BT ESP32** — offload Bluepad32 onto its own chip; main controller
+   becomes BT-free (no btstack, no WiFi/BT coexistence, no timing constraints from BT)
+
+When tier 3 lands: a second ESP32 (cheap NodeMCU is fine) runs Bluepad32 only and
+publishes controller state to the main controller. Simplest comm channel is I2C
+(piggyback on the existing PCF8575 bus — main controller polls BT-ESP32 as an I2C
+peripheral at 50–100 Hz). Failsafe: main stops motors if frames go stale >500ms.

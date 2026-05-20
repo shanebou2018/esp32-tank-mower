@@ -23,7 +23,8 @@
 
 #define RELAY_ARM       32
 #define RELAY_MOTOR     33
-#define RELAY_TURBO     15
+#define RELAY_TURBO     27   // moved from GPIO 15 (strapping pin — relay coil weak-pulled
+                             // it low at boot, causing silent boot mode)
 
 #define ENCODER_L_PIN   34
 #define ENCODER_R_PIN   35
@@ -56,10 +57,8 @@
 // ── Serial1 — Pi bridge + Pip-Boy (shared via GPIO matrix) ───────────────────
 // UART1 TX primary pin: GPIO 17 → Pi RX.   UART1 RX: GPIO 13 ← Pi TX.
 // gpio_matrix_out() in setup() also routes UART1 TX to GPIO 4 (Pip-Boy).
-// Both Pi and Pip-Boy receive every Serial1 line.
+// Both Pi and Pip-Boy receive every Serial1 line; both run at PI_BAUD.
 #define ESP2_SERIAL_TX  4       // Pip-Boy RX — routed from UART1 TX via GPIO matrix
-#define ESP2_SERIAL_RX  5       // (reserved, not currently used)
-#define ESP2_BAUD       115200
 
 // ── Pi serial bridge ──────────────────────────────────────────────────────────
 #define PI_SERIAL_TX    17      // UART1 TX primary pin → Pi RX
