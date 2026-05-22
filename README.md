@@ -45,11 +45,10 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
 |-----------|---------|
 | Microcontroller | ESP32-DevKitC-32UE (WROOM-32UE, external U.FL antenna) |
 | Controller | Sony PS4 DualShock 4 |
-| Motor driver | Cytron MDDS30 SmartDriveDuo (serial simplified mode) |
+| Motor driver | GPIO 25 Cytron MDDS30 SmartDriveDuo (serial simplified mode) |
 | Relay — Arm | GPIO 32 — safety interlock, momentary during start |
 | Relay — Motor | GPIO 33 — latching mower blade relay |
 | Relay — Turbo | GPIO 27 — latching turbo relay |
-| Track motors | 2x DC motors via MDDS30 |
 | Wheel encoders | 2x AS5600 magnetic encoders (PWM mode) |
 | I2C I/O expander | PCF8575 @ 0x20 — battery levels, mower error, lights, turbo feedback |
 
