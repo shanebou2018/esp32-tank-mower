@@ -18,11 +18,11 @@
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 // Motor serial: GPIO 25 → MDDS30 IN1 (TX-only, Serial Simplified).
-#define MDDS30_TX_PIN   25 /// A7
+#define MDDS30_TX_PIN   25 /// A7 con
 #define MDDS30_BAUD     115200   // DIP SW6-8=111 → 115200 baud
 
-#define RELAY_ARM       32 /// A4
-#define RELAY_MOTOR     33 /// A5
+#define RELAY_ARM       32 /// A4 con
+#define RELAY_MOTOR     33 /// A5 con
 #define RELAY_TURBO     27   /// A6 moved from GPIO 15 (strapping pin — relay coil weak-pulled
                              // it low at boot, causing silent boot mode)
 
@@ -61,7 +61,7 @@
 #define ESP2_SERIAL_TX  4       // Pip-Boy RX — routed from UART1 TX via GPIO matrix
 
 // ── Pi serial bridge ──────────────────────────────────────────────────────────
-#define PI_SERIAL_TX    17      ///A15 UART1 TX primary pin → Pi RX
+#define PI_SERIAL_TX    17      ///A15  UART1 TX primary pin → Pi RX
 #define PI_SERIAL_RX    13      ///A14 UART1 RX ← Pi TX
 #define PI_BAUD         115200
 #define PI_TELEM_MS     50
