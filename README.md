@@ -43,30 +43,42 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
 
 | Component | Details |
 |-----------|---------|
-| Microcontroller | ESP32 (any standard dev board) |
+| Microcontroller | ESP32-DevKitC-32UE (WROOM-32UE, external U.FL antenna) |
 | Controller | Sony PS4 DualShock 4 |
-| Motor drivers | 2x Cytron MD13S 13A DC Motor Driver |
-| Relay — Arm | Pin 32 — safety interlock, momentary during start |
-| Relay — Motor | Pin 33 — latching mower blade relay |
-| Relay — Turbo | Pin 15 — latching turbo relay |
-| Track motors | 2x DC motors via MD13S |
+| Motor driver | Cytron MDDS30 SmartDriveDuo (serial simplified mode) |
+| Relay — Arm | GPIO 32 — safety interlock, momentary during start |
+| Relay — Motor | GPIO 33 — latching mower blade relay |
+| Relay — Turbo | GPIO 27 — latching turbo relay |
+| Track motors | 2x DC motors via MDDS30 |
 | Wheel encoders | 2x AS5600 magnetic encoders (PWM mode) |
+| I2C I/O expander | PCF8575 @ 0x20 — battery levels, mower error, lights, turbo feedback |
 
 ### Pin Map — Phase 1
 
-| Signal | ESP32 Pin | Notes |
-|--------|-----------|-------|
-| Left track PWM | 25 | Cytron MD13S PWM |
-| Left track DIR | 26 | Cytron MD13S DIR |
-| Right track PWM | 27 | Cytron MD13S PWM |
-| Right track DIR | 14 | Cytron MD13S DIR |
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| MDDS30 serial TX | 25 | Serial Simplified → MDDS30 IN1 only; disconnect AN1/AN2/IN2 |
 | Arm relay | 32 | Active HIGH |
 | Motor relay | 33 | Active HIGH, latching |
-| Turbo relay | 15 | Active HIGH, latching |
+| Turbo relay | 27 | Active HIGH, latching (moved from GPIO 15 — strapping pin) |
 | Left encoder PWM | 34 | AS5600 PWM output |
 | Right encoder PWM | 35 | AS5600 PWM output |
-| Pi Serial2 TX | 17 | ESP32 TX2 → Pi GPIO15 (RX) |
-| Pi Serial2 RX | 16 | ESP32 RX2 ← Pi GPIO14 (TX) |
+| I2C SDA | 21 | PCF8575 |
+| I2C SCL | 22 | PCF8575 |
+| Pi serial TX | 17 | UART1 TX → Pi RX |
+| Pi serial RX | 13 | UART1 RX ← Pi TX |
+| Pip-Boy serial RX | 4 | UART1 TX also routed here via GPIO matrix |
+
+### MDDS30 DIP Switch Settings
+
+`11011111` — SW1=ON SW2=ON SW3=OFF SW4=ON SW5=ON SW6=ON SW7=ON SW8=ON
+
+| Switches | Setting |
+|----------|---------|
+| SW1+SW2 | Serial mode |
+| SW3 | Serial Simplified |
+| SW4+SW5 | Independent Both |
+| SW6+SW7+SW8 | 115200 baud |
 
 ### Controls — Phase 1
 
@@ -88,7 +100,7 @@ A two-phase project to build a PS4-controlled RC lawn mower (Phase 1) that evolv
    ```
 2. Go to **Tools > Board > Boards Manager**, search **Bluepad32**, install.
 3. Select board: **ESP32 + Bluepad32**
-4. Open `phase1/src/tank_controller_bp32.ino`
+4. Open `phase1/src/32E_tank_controller_bp32_v3.2.0/32E_tank_controller_bp32_v3.2.0.ino`
 5. Flash to your ESP32
 6. Hold the PS button on your controller to pair — no extra tools needed
 
@@ -139,6 +151,7 @@ ESP32 → Pi:  {"enc_l":1024,"enc_r":1019,"relay_motor":1,"relay_turbo":0}
 esp32-tank-mower/
 │
 ├── README.md
+├── CLAUDE.md
 ├── CHANGELOG.md
 ├── LICENSE
 ├── .gitignore
@@ -151,10 +164,18 @@ esp32-tank-mower/
 │
 ├── phase1/
 │   └── src/
-│       └── tank_controller_bp32.ino
+│       ├── 32E_tank_controller_bp32_v3.2.0/   # Active firmware (multi-file)
+│       │   ├── 32E_tank_controller_bp32_v3.2.0.ino  # Global defs, setup(), loop()
+│       │   ├── types.h             # All #defines, enums, structs, externs, prototypes
+│       │   ├── debug.cpp           # Debug helpers
+│       │   ├── drive.cpp           # LED, stick curve, motor bytes, arm state machine
+│       │   ├── bt_callbacks.cpp    # Bluepad32 connect/disconnect callbacks
+│       │   ├── io_task.cpp         # PCF8575 I/O task (Core 0)
+│       │   └── NOTES.md            # Hardware, RTOS, motor protocol, BT notes
+│       └── old/                    # Previous versions (v2.1.0 – v3.1.0)
 │
 └── phase2/
-    ├── esp32/                      # Updated ESP32 firmware with serial bridge
+    ├── esp32/                      # ESP32 firmware with Pi serial bridge
     │   └── README.md
     └── pi/
         ├── src/                    # Python entry points

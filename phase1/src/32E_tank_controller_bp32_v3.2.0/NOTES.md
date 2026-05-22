@@ -90,7 +90,7 @@ Commands throttled to 20 Hz keepalive; fires immediately on any speed change.
 
 ## Key tuning constants (all in `types.h`)
 
-| Constant | Default | Effect |
+| Constant | Default |aqZWA Effect |
 |---|---|---|
 | `DEADZONE` | 20 | Stick dead band (0–511 scale) |
 | `MAX_SPEED` | 100 | Motor speed ceiling sent to MDDS30 |
