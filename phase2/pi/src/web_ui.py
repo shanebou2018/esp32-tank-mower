@@ -453,12 +453,13 @@ def api_lidar():
     front   = lidar.get_sector_min(0, 20)
     stats   = lidar.get_stats()
     display = scan[::2] if len(scan) > 200 else scan
+    c_angle, c_dist = closest
     return jsonify({
         "connected":      lidar.is_connected(),
         "points":         len(scan),
         "scan":           display,
-        "closest_angle":  closest[0],
-        "closest_dist":   closest[1],
+        "closest_angle":  c_angle if c_angle is not None else 0,
+        "closest_dist":   c_dist  if c_dist  is not None else 999,
         "front_dist":     front,
         "scan_count":     stats["scan_count"],
         "packets_parsed": stats.get("packets_parsed", stats.get("scan_count", 0)),
