@@ -25,6 +25,12 @@ LIDAR_PORT   = "/dev/ttyUSB0"
 MAX_DIST_M   = 10.0
 MIN_DIST_M   = 0.12
 
+# Noise filter — an angle must appear in at least this many scans within the
+# buffer window before it is published. With AVERAGE_WINDOW=0.5s at ~7Hz,
+# the buffer holds ~3-4 scans; MIN_SCAN_HITS=2 rejects single-scan speckle
+# while still responding quickly to real obstacles.
+MIN_SCAN_HITS = 2
+
 # Mounting calibration — degrees added after the CW→CCW flip.
 # The YDLIDAR X4 angles increase clockwise (viewed from above).
 # We flip to CCW so 90° = left / 270° = right in the navigator.
@@ -173,16 +179,23 @@ class LidarX4:
                             if now - t <= self.AVERAGE_WINDOW
                         ]
 
-                        # Per-angle minimum over the buffer window.
-                        # Minimum (not mean) ensures an approaching obstacle
-                        # is never diluted by older, farther readings.
+                        # Per-angle minimum over the buffer window, with a
+                        # consistency gate: an angle must appear in at least
+                        # MIN_SCAN_HITS scans before it is published. This
+                        # keeps sensitivity to approaching obstacles while
+                        # rejecting single-scan noise spikes.
                         angle_mins = {}
+                        angle_hits = {}
                         for _, s in self._scan_buffer:
                             for a, d in s.items():
                                 if MIN_DIST_M <= d <= MAX_DIST_M:
+                                    angle_hits[a] = angle_hits.get(a, 0) + 1
                                     if a not in angle_mins or d < angle_mins[a]:
                                         angle_mins[a] = d
-                        self._min_scan = angle_mins
+                        self._min_scan = {
+                            a: d for a, d in angle_mins.items()
+                            if angle_hits.get(a, 0) >= MIN_SCAN_HITS
+                        }
 
                     valid = sum(1 for v in scan_m.values() if MIN_DIST_M <= v <= MAX_DIST_M)
                     logger.debug(f"[LIDAR] Scan {self._scan_count}: {valid} valid pts "
