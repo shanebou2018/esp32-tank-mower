@@ -7,8 +7,11 @@
 #    from lidar import LidarX4
 #    lidar = LidarX4()
 #    lidar.start()
-#    scan = lidar.get_scan()   # dict {angle_int: dist_m} or list [(angle, dist)]
+#    scan = lidar.get_scan()   # list [(angle_deg, dist_m)]
 #    lidar.stop()
+#
+#  Angle convention (after CW→CCW flip):
+#    0° = robot forward, 90° = left, 180° = rear, 270° = right
 # ============================================================
 
 import threading
@@ -22,12 +25,23 @@ LIDAR_PORT   = "/dev/ttyUSB0"
 MAX_DIST_M   = 10.0
 MIN_DIST_M   = 0.12
 
+# Mounting calibration — degrees added after the CW→CCW flip.
+# The YDLIDAR X4 angles increase clockwise (viewed from above).
+# We flip to CCW so 90° = left / 270° = right in the navigator.
+# Adjust ANGLE_OFFSET until 0° points straight forward on the robot;
+# increase to rotate the scan clockwise, decrease to rotate CCW.
+ANGLE_OFFSET = 0   # degrees — tune for your mounting orientation
+
 
 class LidarX4:
     """
     Continuous background reader for the YDLIDAR X4.
-    Uses PyLidar3 which handles the protocol correctly.
     Thread safe — call get_scan() from any thread.
+
+    Per-angle minimum is kept over a short buffer window (not mean) so
+    that an approaching obstacle is never diluted by older, farther readings.
+    Sensor dropout is detected via is_connected(); get_sector_min() returns
+    0.0 (below STOP_DIST) when no data is available so callers fail safe.
     """
 
     def __init__(self, port=LIDAR_PORT):
@@ -36,16 +50,15 @@ class LidarX4:
         self._lock       = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Latest scan — dict {angle_deg(int 0-359): dist_m}
         self._scan       = {}
         self._scan_count = 0
         self._last_scan  = 0.0
         self._thread     = None
 
-        # Temporal averaging — accumulate scans over AVERAGE_WINDOW seconds
-        self.AVERAGE_WINDOW = 1.0   # seconds
+        # Keep per-angle minimum over this window (shorter = more responsive)
+        self.AVERAGE_WINDOW = 0.5   # seconds (~3-4 scans at 7 Hz)
         self._scan_buffer   = []    # list of (timestamp, scan_dict)
-        self._averaged_scan = {}    # current averaged output
+        self._min_scan      = {}    # per-angle minimum over the buffer
 
     # ── Public API ───────────────────────────────────────────
 
@@ -74,12 +87,11 @@ class LidarX4:
 
     def get_scan(self) -> list:
         """
-        Return temporally averaged scan as list of (angle_deg, dist_m).
-        Averages all scans received in the last AVERAGE_WINDOW seconds.
-        Filters out zero/invalid distances.
+        Return scan as list of (angle_deg, dist_m).
+        Angle 0 = forward, 90 = left, 270 = right (CCW convention).
         """
         with self._lock:
-            return [(a, d) for a, d in self._averaged_scan.items()
+            return [(a, d) for a, d in self._min_scan.items()
                     if MIN_DIST_M <= d <= MAX_DIST_M]
 
     def get_scan_raw(self) -> dict:
@@ -88,14 +100,21 @@ class LidarX4:
             return dict(self._scan)
 
     def get_closest(self) -> tuple:
-        """Return (angle_deg, dist_m) of closest valid obstacle."""
+        """
+        Return (angle_deg, dist_m) of closest valid obstacle.
+        Returns (None, None) when no valid scan data is available.
+        """
         scan = self.get_scan()
         if not scan:
-            return (0, 999)
+            return (None, None)
         return min(scan, key=lambda x: x[1])
 
     def get_sector_min(self, angle_center: float, half_width: float) -> float:
-        """Minimum distance in a sector. Returns 999 if no valid readings."""
+        """
+        Minimum distance in a sector (metres).
+        Returns 0.0 when no valid readings exist — callers must treat this
+        as 'blocked / sensor unavailable', not 'all clear'.
+        """
         scan = self.get_scan()
         dists = []
         for a, d in scan:
@@ -104,17 +123,22 @@ class LidarX4:
                 diff = 360 - diff
             if diff <= half_width:
                 dists.append(d)
-        return min(dists) if dists else 999
+        return min(dists) if dists else 0.0
 
     def is_connected(self) -> bool:
-        """True if scan data arrived within last 2 seconds."""
-        return (time.time() - self._last_scan) < 2.0
+        """True if a scan arrived within the last 2 seconds."""
+        with self._lock:
+            last = self._last_scan
+        return (time.time() - last) < 2.0
 
     def get_stats(self) -> dict:
+        with self._lock:
+            count = self._scan_count
+            last  = self._last_scan
         return {
-            "scan_count": self._scan_count,
-            "last_scan":  self._last_scan,
-            "connected":  self.is_connected()
+            "scan_count": count,
+            "last_scan":  last,
+            "connected":  (time.time() - last) < 2.0,
         }
 
     # ── Private ──────────────────────────────────────────────
@@ -125,38 +149,45 @@ class LidarX4:
             gen = self._lidar.StartScanning()
             while not self._stop_event.is_set():
                 try:
-                    raw = next(gen)  # dict {angle(int): distance(float, mm)}
-                    # Convert mm to m
-                    scan_m = {a: d / 1000.0 for a, d in raw.items()}
+                    raw = next(gen)  # dict {angle(int 0-359): distance(float, mm)}
+
+                    # Flip CW→CCW and apply mounting offset so that
+                    # 0° = forward, 90° = left, 270° = right.
+                    # PyLidar3 confirmed to yield distances in millimetres;
+                    # divide by 1000 to get metres.
+                    scan_m = {
+                        (360 - a + ANGLE_OFFSET) % 360: d / 1000.0
+                        for a, d in raw.items()
+                    }
+
                     now = time.time()
                     with self._lock:
                         self._scan       = scan_m
                         self._scan_count += 1
                         self._last_scan  = now
 
-                        # Add to buffer and drop old scans
+                        # Maintain rolling buffer
                         self._scan_buffer.append((now, scan_m))
                         self._scan_buffer = [
                             (t, s) for t, s in self._scan_buffer
                             if now - t <= self.AVERAGE_WINDOW
                         ]
 
-                        # Recompute averaged scan
-                        angle_sums   = {}
-                        angle_counts = {}
+                        # Per-angle minimum over the buffer window.
+                        # Minimum (not mean) ensures an approaching obstacle
+                        # is never diluted by older, farther readings.
+                        angle_mins = {}
                         for _, s in self._scan_buffer:
                             for a, d in s.items():
                                 if MIN_DIST_M <= d <= MAX_DIST_M:
-                                    angle_sums[a]   = angle_sums.get(a, 0.0) + d
-                                    angle_counts[a] = angle_counts.get(a, 0) + 1
-                        self._averaged_scan = {
-                            a: angle_sums[a] / angle_counts[a]
-                            for a in angle_sums
-                        }
+                                    if a not in angle_mins or d < angle_mins[a]:
+                                        angle_mins[a] = d
+                        self._min_scan = angle_mins
 
                     valid = sum(1 for v in scan_m.values() if MIN_DIST_M <= v <= MAX_DIST_M)
                     logger.debug(f"[LIDAR] Scan {self._scan_count}: {valid} valid pts "
                                  f"buf={len(self._scan_buffer)}")
+
                 except StopIteration:
                     logger.warning("[LIDAR] Scan generator stopped")
                     break
@@ -187,7 +218,8 @@ if __name__ == "__main__":
             closest = lidar.get_closest()
             stats   = lidar.get_stats()
             print(f"\nScan {stats['scan_count']}: {len(scan)} valid points")
-            print(f"Closest: {closest[1]:.3f}m at {closest[0]}deg")
+            if closest[0] is not None:
+                print(f"Closest: {closest[1]:.3f}m at {closest[0]}deg")
             print(f"Front (0+-20deg): {lidar.get_sector_min(0, 20):.3f}m")
             print("\nAngle distribution (45deg sectors):")
             sectors = [0] * 8

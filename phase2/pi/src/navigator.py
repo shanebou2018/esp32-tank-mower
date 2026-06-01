@@ -11,7 +11,8 @@
 #   BLOCKED  — obstacle within STOP_DIST in front, stop and
 #              decide which way to go around
 #   AVOIDING — actively steering around an obstacle
-#   STUCK    — couldn't find a clear path after STUCK_TIMEOUT
+#   STUCK    — couldn't find a clear path after STUCK_TIMEOUT,
+#              or LiDAR data went stale (emergency stop)
 #
 # Usage:
 #   from navigator import Navigator
@@ -21,42 +22,41 @@
 #   # In your coverage loop — call this instead of bridge.drive():
 #   nav.request_drive(left, right)
 #
-#   state = nav.get_state()   # "CLEAR" / "WARN" / "BLOCKED" / "AVOIDING" / "STUCK"
+#   state = nav.get_nav_state()   # "CLEAR" / "WARN" / "BLOCKED" / "AVOIDING" / "STUCK"
 #   nav.stop()
 #
-# Sector layout (YDLIDAR X4 — 0deg = forward on robot):
+# Sector layout (YDLIDAR X4 — CCW convention, 0 = forward):
 #
 #        FRONT (0 ± FRONT_HALF)
 #          |
 #   LEFT --+-- RIGHT
+#  (90°)        (270°)
 #          |
 #        REAR  (180 ± REAR_HALF)
 #
 # Obstacle avoidance strategy:
 #   1. Obstacle detected in front → stop
-#   2. Check left sector vs right sector
-#   3. Turn toward the clearer side
-#   4. Drive forward until front is clear
-#   5. Resume original heading using compass
-#   6. Caller's coverage loop continues
+#   2. Check rear before reversing — skip backup if rear is blocked
+#   3. Check left sector vs right sector; turn toward the clearer side
+#   4. Drive forward (capped at AVOID_FWD_TIME) until front is clear
+#   5. Resume — coverage planner's heading correction handles drift
 #
 # All compass angles are in degrees (0–360, BNO055 convention).
 # ============================================================
 
 import threading
 import time
-import math
 import logging
 
 logger = logging.getLogger(__name__)
 
-# ── LiDAR sector definitions (degrees, 0 = forward) ─────────
+# ── LiDAR sector definitions (degrees, CCW, 0 = forward) ────
 FRONT_CENTER  =   0
 FRONT_HALF    =  30    # ±30° cone ahead = 60° total front zone
 FRONT_NEAR    =  15    # ±15° tight cone for very close detection
 
-LEFT_CENTER   =  90    # left side
-RIGHT_CENTER  = 270    # right side
+LEFT_CENTER   =  90    # left side  (CCW convention)
+RIGHT_CENTER  = 270    # right side (CCW convention)
 SIDE_HALF     =  40    # ±40° each side
 
 REAR_CENTER   = 180
@@ -77,7 +77,7 @@ BACK_SPEED    = 50     # reverse speed during backup manoeuvre
 POLL_INTERVAL   = 0.05   # 20 Hz
 BACKUP_TIME     = 0.6    # seconds to reverse before turning
 TURN_TIME       = 1.2    # seconds to turn 90° (tune to your mower)
-AVOID_FWD_TIME  = 1.5    # seconds to drive forward during avoid arc
+AVOID_FWD_TIME  = 1.5    # seconds to drive forward during avoid arc before reassessing
 STUCK_TIMEOUT   = 12.0   # give up and halt after this many seconds avoiding
 RESUME_HOLD     = 1.0    # seconds to hold avoidance clear before resuming
 
@@ -117,7 +117,7 @@ class Navigator:
         self._state          = NavState.CLEAR
         self._avoid_start    = 0.0
         self._avoid_turn_dir = 1     # +1 = turn right, -1 = turn left
-        self._resume_heading = None  # compass heading to resume after avoid
+        self._resume_heading = None  # compass heading before obstacle was hit
         self._clear_since    = None  # timestamp when front last became clear
 
         # Stats
@@ -141,7 +141,6 @@ class Navigator:
         with self._lock:
             self._movement_enabled = False
             self._state = NavState.CLEAR
-        # Don't zero the bridge here — caller decides (coverage keeps state)
         logger.info("[NAV] Movement DISABLED — motor commands blocked")
 
     def enable_avoidance(self):
@@ -210,6 +209,7 @@ class Navigator:
                 "right_m":            round(right, 2),
                 "avoidance_count":    self._avoidance_count,
                 "stuck_count":        self._stuck_count,
+                "lidar_ok":           self._lidar.is_connected(),
             }
 
     def is_clear(self) -> bool:
@@ -233,50 +233,53 @@ class Navigator:
             if not self._movement_enabled:
                 return   # gates closed — no motor commands issued
 
+        # Safety: stale LiDAR → emergency stop
+        if not self._lidar.is_connected():
+            logger.error("[NAV] LiDAR data stale — emergency stop")
+            self._bridge.stop()
+            with self._lock:
+                self._state = NavState.STUCK
+                self._stuck_count += 1
+            return
+
         front = self._lidar.get_sector_min(FRONT_CENTER, FRONT_HALF)
         left  = self._lidar.get_sector_min(LEFT_CENTER,  SIDE_HALF)
         right = self._lidar.get_sector_min(RIGHT_CENTER, SIDE_HALF)
+        rear  = self._lidar.get_sector_min(REAR_CENTER,  REAR_HALF)
 
         with self._lock:
             state = self._state
 
         if state == NavState.CLEAR or state == NavState.WARN:
             self._tick_normal(front, left, right)
-
         elif state == NavState.BLOCKED:
-            self._tick_blocked(front, left, right)
-
+            self._tick_blocked(front, left, right, rear)
         elif state == NavState.AVOIDING:
             self._tick_avoiding(front, left, right)
-
         elif state == NavState.STUCK:
-            # Hard stop — coverage planner must intervene
             self._bridge.stop()
 
     def _tick_normal(self, front, left, right):
         """CLEAR or WARN — pass through or scale coverage request."""
         with self._lock:
-            req_l            = self._req_left
-            req_r            = self._req_right
-            avoidance_on     = self._avoidance_enabled
+            req_l        = self._req_left
+            req_r        = self._req_right
+            avoidance_on = self._avoidance_enabled
 
         if not avoidance_on:
-            # Avoidance disabled — pass drive request straight through
             self._bridge.drive(req_l, req_r)
             with self._lock:
                 self._state = NavState.CLEAR
             return
 
         if front <= STOP_DIST:
-            # Transition to BLOCKED
             logger.warning(f"[NAV] BLOCKED — front={front:.2f}m")
             self._bridge.stop()
             with self._lock:
                 self._state       = NavState.BLOCKED
                 self._avoid_start = time.time()
-                # Choose turn direction toward the clearer side
+                # Turn toward the clearer side
                 self._avoid_turn_dir = 1 if right >= left else -1
-                # Remember heading to restore after avoid
                 if self._compass and self._compass.is_calibrated():
                     self._resume_heading = self._compass.get_heading()
                 else:
@@ -284,32 +287,35 @@ class Navigator:
             return
 
         if front <= WARN_DIST:
-            # Scale speed proportionally between WARN and STOP
             ratio = (front - STOP_DIST) / (WARN_DIST - STOP_DIST)
             ratio = max(0.0, min(1.0, ratio))
             scale = ratio * (1.0 - SLOW_SPEED / CRUISE_SPEED) + SLOW_SPEED / CRUISE_SPEED
-            scaled_l = int(req_l * scale)
-            scaled_r = int(req_r * scale)
-            self._bridge.drive(scaled_l, scaled_r)
+            self._bridge.drive(int(req_l * scale), int(req_r * scale))
             with self._lock:
                 self._state = NavState.WARN
         else:
-            # Full clear
             self._bridge.drive(req_l, req_r)
             with self._lock:
                 self._state = NavState.CLEAR
 
-    def _tick_blocked(self, front, left, right):
-        """BLOCKED — back up briefly, then begin turn."""
+    def _tick_blocked(self, front, left, right, rear):
+        """BLOCKED — check rear, back up, then begin turn."""
         with self._lock:
-            elapsed = time.time() - self._avoid_start
+            elapsed  = time.time() - self._avoid_start
             turn_dir = self._avoid_turn_dir
 
         if elapsed < BACKUP_TIME:
-            # Phase 1: reverse
-            self._bridge.drive(-BACK_SPEED, -BACK_SPEED)
+            if rear <= STOP_DIST:
+                # Obstacle behind — skip backup, go straight to turn
+                logger.warning(f"[NAV] Rear blocked ({rear:.2f}m) — skipping backup")
+                with self._lock:
+                    self._state          = NavState.AVOIDING
+                    self._avoid_start    = time.time()
+                    self._avoidance_count += 1
+                    self._clear_since    = None
+            else:
+                self._bridge.drive(-BACK_SPEED, -BACK_SPEED)
         else:
-            # Phase 2: start turning — transition to AVOIDING
             logger.info(f"[NAV] AVOIDING — turning {'right' if turn_dir > 0 else 'left'}")
             with self._lock:
                 self._state          = NavState.AVOIDING
@@ -322,10 +328,8 @@ class Navigator:
         with self._lock:
             elapsed  = time.time() - self._avoid_start
             turn_dir = self._avoid_turn_dir
-            stuck_t  = STUCK_TIMEOUT
 
-        # Check for stuck
-        if elapsed > stuck_t:
+        if elapsed > STUCK_TIMEOUT:
             logger.error("[NAV] STUCK — could not clear obstacle")
             self._bridge.stop()
             with self._lock:
@@ -340,63 +344,55 @@ class Navigator:
             else:              # turn left
                 self._bridge.drive(-TURN_SPEED, TURN_SPEED)
         else:
-            # Forward arc phase: creep forward
+            # Forward arc phase
+            arc_elapsed = elapsed - TURN_TIME
+
+            # Side-wall check — if a wall appears during the arc, re-block
+            if min(left, right) <= STOP_DIST:
+                logger.warning(f"[NAV] Side obstacle during arc "
+                               f"(L={left:.2f} R={right:.2f}) — re-blocking")
+                self._bridge.stop()
+                with self._lock:
+                    self._state          = NavState.BLOCKED
+                    self._avoid_start    = time.time()
+                    self._avoid_turn_dir = 1 if right >= left else -1
+                    self._clear_since    = None
+                return
+
+            # Cap arc duration — re-evaluate if still blocked after AVOID_FWD_TIME
+            if arc_elapsed > AVOID_FWD_TIME:
+                logger.info("[NAV] Arc timeout — re-blocking to reassess")
+                self._bridge.stop()
+                with self._lock:
+                    self._state          = NavState.BLOCKED
+                    self._avoid_start    = time.time()
+                    self._avoid_turn_dir = 1 if right >= left else -1
+                    self._clear_since    = None
+                return
+
             self._bridge.drive(SLOW_SPEED, SLOW_SPEED)
 
             if front >= CLEAR_DIST:
-                # Front clearing — start hold timer
                 with self._lock:
                     if self._clear_since is None:
                         self._clear_since = time.time()
                     clear_elapsed = time.time() - self._clear_since
-
                 if clear_elapsed >= RESUME_HOLD:
-                    # Confirmed clear — resume coverage
                     logger.info(f"[NAV] Clear — resuming after {elapsed:.1f}s avoid")
                     self._resume_coverage()
             else:
-                # Obstacle still present — reset clear timer
                 with self._lock:
                     self._clear_since = None
 
     def _resume_coverage(self):
-        """Transition back to CLEAR and restore compass heading if available."""
+        """Transition back to CLEAR. Coverage planner corrects heading drift naturally."""
         with self._lock:
             self._state          = NavState.CLEAR
-            resume_hdg           = self._resume_heading
             self._resume_heading = None
             self._clear_since    = None
-
-        if resume_hdg is not None and self._compass and self._compass.is_calibrated():
-            # Spin back toward original heading
-            self._correct_heading(resume_hdg)
-
         logger.info("[NAV] Avoidance complete — coverage resumed")
-
-    def _correct_heading(self, target_deg: float, timeout: float = 3.0):
-        """
-        Spin in place until compass heading is within 10° of target.
-        Blocks for up to `timeout` seconds.
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not self._compass.is_calibrated():
-                break
-            current = self._compass.get_heading()
-            error   = _angle_diff(target_deg, current)  # signed -180..+180
-            if abs(error) < 10.0:
-                break
-            # Turn toward target
-            if error > 0:
-                self._bridge.drive(TURN_SPEED, -TURN_SPEED)
-            else:
-                self._bridge.drive(-TURN_SPEED, TURN_SPEED)
-            time.sleep(0.05)
-        self._bridge.stop()
-        time.sleep(0.1)
 
 
 def _angle_diff(target: float, current: float) -> float:
     """Signed difference target - current, normalised to -180..+180."""
-    d = (target - current + 180) % 360 - 180
-    return d
+    return (target - current + 180) % 360 - 180
