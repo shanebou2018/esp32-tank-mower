@@ -261,6 +261,8 @@ class CoveragePlanner:
             self._strip_start_x = start_x
             self._strip_start_y = start_y
 
+        prev_dist = 0.0   # track incremental odometry delta each tick
+
         while not self._stop_event.is_set():
             # Check nav state
             nav_state = self._nav.get_nav_state()
@@ -276,11 +278,12 @@ class CoveragePlanner:
                 time.sleep(SETTLE_TIME)
                 return True
 
-            # Check strip distance
+            # Accumulate total distance using incremental delta (not cumulative dist)
             pose = self._odom.get_pose()
             dist = math.hypot(pose["x"] - start_x, pose["y"] - start_y)
             with self._lock:
-                self._total_dist_m += dist - (self._total_dist_m % 0.001)
+                self._total_dist_m += dist - prev_dist
+            prev_dist = dist
 
             if dist >= MAX_STRIP_LEN_M:
                 logger.warning(f"[COV] Max strip length {MAX_STRIP_LEN_M}m reached")
@@ -309,12 +312,14 @@ class CoveragePlanner:
             target = self._strip_heading
 
         error = _angle_diff(target, current)   # signed -180..+180
-        # P-gain: 1° error → 2 PWM units of differential
+        # P-gain: 1° error → 2 PWM units of differential.
+        # Positive error = target is CW of current = need to turn right.
+        # Turning right on a differential drive = left motor faster.
         correction = int(error * 2.0)
         correction = max(-30, min(30, correction))
 
-        left  = CRUISE_SPEED - correction
-        right = CRUISE_SPEED + correction
+        left  = CRUISE_SPEED + correction
+        right = CRUISE_SPEED - correction
         left  = max(-127, min(127, left))
         right = max(-127, min(127, right))
         return (left, right)
@@ -379,10 +384,21 @@ class CoveragePlanner:
         return False
 
     def _timed_turn(self, target_deg: float) -> bool:
-        """Fallback: timed 90° turn when compass unavailable."""
-        # Rough estimate — tune TURN_SPEED / TURN_TIME to match your mower
-        self._nav.request_drive(TURN_SPEED, -TURN_SPEED)
-        time.sleep(TURN_TIMEOUT / 2)
+        """
+        Fallback: direction-aware timed turn when compass unavailable.
+        Uses _strip_heading as the reference to compute turn direction and
+        a proportional duration (calibrated so 90° ≈ TURN_TIMEOUT/2 seconds).
+        """
+        with self._lock:
+            ref = self._strip_heading
+        error = _angle_diff(target_deg, ref)   # signed, negative = turn left
+        if error > 0:
+            self._nav.request_drive(TURN_SPEED, -TURN_SPEED)   # right
+        else:
+            self._nav.request_drive(-TURN_SPEED, TURN_SPEED)   # left
+        # Scale duration proportionally; clamp to [0.5, TURN_TIMEOUT]
+        duration = abs(error) / 90.0 * (TURN_TIMEOUT / 2)
+        time.sleep(max(0.5, min(duration, TURN_TIMEOUT)))
         self._nav.request_drive(0, 0)
         time.sleep(SETTLE_TIME)
         return True
