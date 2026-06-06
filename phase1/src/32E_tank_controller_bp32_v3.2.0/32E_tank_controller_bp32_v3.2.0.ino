@@ -1,6 +1,10 @@
 // ============================================================
-// ESP32 Tank Mower — Phase 2 Firmware  v3.2.0
+// ESP32 Tank Mower — Phase 2 Firmware  v3.3.0
 // Board: ESP32-DevKitC-32E (ESP32-WROOM-32E)
+//
+// v3.3.0: OTA update window (60 s WiFi at boot, hostname "tank-mower"),
+//   speed category selector (Circle: 1×=Low 40%, 2×=Med 70%, 3×=Fast 100%;
+//   hold 1.5 s resets to Low), deceleration smoothing (DECEL_RATE units/s).
 //
 // v3.2.0: refactored into multi-file sketch — no functional changes.
 //   File structure:
@@ -70,6 +74,10 @@ int           dpadSpeed   = 0;
 unsigned long lastFlash   = 0;
 bool          flashState  = false;
 
+bool          otaWindowActive = false;
+unsigned long otaWindowStart  = 0;
+int           speedCat        = 3;   // 1=Low (40%), 2=Med (70%), 3=Fast (100%)
+
 // ============================================================
 // setup()
 // ============================================================
@@ -87,11 +95,39 @@ void setup() {
   Serial.setTxBufferSize(1024);
   Serial.begin(115200);
   delay(400);
-  debugBanner("ESP32-DevKitC-32E TANK MOWER — PHASE 2 v3.2.0");
+  debugBanner("ESP32-DevKitC-32E TANK MOWER — PHASE 2 v3.3.0");
   Serial.print(F("  Chip    : ")); Serial.println(ESP.getChipModel());
   Serial.print(F("  CPU MHz : ")); Serial.println(ESP.getCpuFreqMHz());
   Serial.print(F("  Heap    : ")); Serial.print(ESP.getFreeHeap()); Serial.println(F(" bytes"));
   debugSep();
+
+  // ── WiFi + ArduinoOTA — 60-second update window at boot ──────────
+  // WiFi connects in the background; OTA becomes available once connected.
+  // loop() stops WiFi when the window expires or a controller pairs,
+  // restoring full BT radio time for outdoor use.
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    Serial.println(F("[OTA ] Receiving firmware..."));
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println(F("[OTA ] Done — rebooting"));
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static uint8_t lastPct = 255;
+    uint8_t pct = (uint8_t)(progress * 100 / total);
+    if (pct != lastPct) { lastPct = pct; Serial.print('.'); }
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    Serial.print(F("[OTA ] Error ")); Serial.println((int)err);
+  });
+  ArduinoOTA.begin();
+  otaWindowActive = true;
+  otaWindowStart  = millis();
+  Serial.print(F("[OTA ] Window open (")); Serial.print(OTA_WINDOW_MS / 1000);
+  Serial.print(F("s) — hostname: ")); Serial.println(OTA_HOSTNAME);
+  Serial.print(F("  SSID: ")); Serial.println(WIFI_SSID);
 
   // ── MDDS30 motor serial — Serial2, TX-only on GPIO 25 ────────────
   Serial2.begin(MDDS30_BAUD, SERIAL_8N1, -1, MDDS30_TX_PIN);
@@ -160,16 +196,14 @@ void setup() {
   BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
 
   // ── BT RF optimisations ──────────────────────────────────────────
-  // WiFi and Classic BT share one 2.4GHz radio on ESP32.
-  // Even without WiFi.begin(), the coexistence controller can steal BT air time.
-  esp_wifi_stop();   // harmless if WiFi was never started
+  // WiFi stays active during the OTA window.  loop() calls esp_wifi_stop()
+  // when the window closes or a controller pairs, restoring full BT air time.
 
   // PS4 uses BR/EDR (Classic BT). Default TX power is +3dBm.
   // Raise both min and max to +9dBm (maximum) for full range.
   esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
 
   debugSep();
-  Serial.println(F("[BT ] WiFi radio stopped"));
   Serial.println(F("[BT ] Classic BT TX power: +9dBm"));
   Serial.println(F("[BT ] Ready — hold PS to pair"));
   Serial.println(F("  PS    = toggle mode  (LED: blue=dual / green=single)"));
@@ -179,6 +213,8 @@ void setup() {
   Serial.println(F("  CROSS = hold to show controller battery on LED"));
   Serial.println(F("  L2    = set D-pad speed ceiling"));
   Serial.println(F("  L1    = reset D-pad speed"));
+  Serial.println(F("  CIRCLE= 1x=Low(40%) 2x=Med(70%) 3x=Fast(100%) hold=reset Low"));
+  Serial.println(F("          (>3s between taps finalises; decel smoothed at stop)"));
   debugSep();
 }
 
@@ -206,8 +242,37 @@ void loop() {
   static unsigned long lastStatusPrint = 0;
   static unsigned long lastDrvLog      = 0;
 
+  // ── Deceleration smoothing state ──────────────────────────────────
+  static unsigned long lastLoopMs = 0;
+  static int           smoothL    = 0;
+  static int           smoothR    = 0;
+
+  // ── Speed category button state (Circle / BUTTON_B) ───────────────
+  static bool          prev_B              = false;
+  static int           speedBtnClicks      = 0;
+  static unsigned long speedBtnLastClick   = 0;
+  static unsigned long speedBtnPressStart  = 0;
+  static bool          speedBtnHoldHandled = false;
+
   // ── 1. BP32 update — first for minimum BT latency ────────────────
   BP32.update();
+
+  // ── 1b. OTA window ────────────────────────────────────────────────
+  // Runs until 60 s timeout or a controller pairs; then WiFi stops so
+  // Classic BT gets the full radio for outdoor range.
+  if (otaWindowActive) {
+    ArduinoOTA.handle();
+    unsigned long otaNow    = millis();
+    bool windowExpired      = (otaNow - otaWindowStart >= OTA_WINDOW_MS);
+    bool ctrlConnected      = (gGamepad && gGamepad->isConnected());
+    if (windowExpired || ctrlConnected) {
+      otaWindowActive = false;
+      esp_wifi_stop();
+      Serial.println(windowExpired
+        ? F("[OTA ] Window closed — WiFi stopped")
+        : F("[OTA ] Controller paired — WiFi stopped"));
+    }
+  }
 
   // ── 2. Arm state machine ──────────────────────────────────────────
   updateArmStateMachine();
@@ -259,11 +324,17 @@ void loop() {
     if (piDriveActive) {
       int scaledL = scaleToMotor(io.pi_leftSpeed);
       int scaledR = scaleToMotor(io.pi_rightSpeed);
+      // Mirror Pi speeds into smooth state so handoff to gamepad starts clean.
+      smoothL = io.pi_leftSpeed;
+      smoothR = io.pi_rightSpeed;
       unsigned long nowM = millis();
       if (scaledL != sentL || scaledR != sentR || nowM - lastMotorMs >= 50) {
         sendMotorBytes(scaledL, scaledR);
         sentL = scaledL; sentR = scaledR; lastMotorMs = nowM;
       }
+    } else {
+      smoothL = 0;
+      smoothR = 0;
     }
     int fakeL = piDriveActive ? io.pi_leftSpeed : 0;
     int fakeR = piDriveActive ? io.pi_rightSpeed : 0;
@@ -374,6 +445,44 @@ void loop() {
   }
   prev_CROSS = curCROSS;
 
+  // ── Circle (B) → speed category selector ─────────────────────────
+  // 1 tap = Low (40%)   2 taps = Medium (70%)   3 taps = Fast (100%)
+  // > 3 s between taps finalises the current count.
+  // Hold > 1.5 s resets to Low without registering a tap.
+  bool curB = (gp->buttons() & BUTTON_B) != 0;
+  if (curB && !prev_B) {
+    speedBtnPressStart  = millis();
+    speedBtnHoldHandled = false;
+  }
+  if (curB && !speedBtnHoldHandled &&
+      (millis() - speedBtnPressStart >= SPEED_HOLD_MS)) {
+    speedCat            = 1;
+    speedBtnClicks      = 0;
+    speedBtnHoldHandled = true;
+    gp->playDualRumble(0, 400, 0xFF, 0x40);
+    Serial.println(F("[SPD ] Hold — reset to LOW (40%)"));
+  }
+  if (!curB && prev_B && !speedBtnHoldHandled) {
+    speedBtnClicks++;
+    speedBtnLastClick = millis();
+    if (speedBtnClicks >= 3) {
+      speedCat       = 3;
+      speedBtnClicks = 0;
+      gp->playDualRumble(0, 300, 0x80, 0xFF);
+      Serial.println(F("[SPD ] 3 taps — FAST (100%)"));
+    }
+  }
+  if (speedBtnClicks > 0 && !curB &&
+      (millis() - speedBtnLastClick >= SPEED_BTN_TIMEOUT_MS)) {
+    speedCat = (speedBtnClicks == 1) ? 1 : (speedBtnClicks == 2) ? 2 : 3;
+    speedBtnClicks = 0;
+    gp->playDualRumble(0, 200, 0x60, 0x60);
+    Serial.print(F("[SPD ] Finalised -> "));
+    Serial.println(speedCat == 1 ? F("LOW (40%)") :
+                   speedCat == 2 ? F("MEDIUM (70%)") : F("FAST (100%)"));
+  }
+  prev_B = curB;
+
   // ── Drive ─────────────────────────────────────────────────────────
   int leftSpeed  = 0;
   int rightSpeed = 0;
@@ -402,10 +511,26 @@ void loop() {
     }
   }
 
+  // Apply speed category multiplier (Circle button)
   {
-    int scaledL = scaleToMotor(leftSpeed);
-    int scaledR = scaleToMotor(rightSpeed);
+    int catPct = (speedCat == 1) ? SPEED_CAT_LOW_PCT :
+                 (speedCat == 2) ? SPEED_CAT_MED_PCT : 100;
+    leftSpeed  = leftSpeed  * catPct / 100;
+    rightSpeed = rightSpeed * catPct / 100;
+  }
+
+  // Deceleration smoothing + motor output
+  {
     unsigned long nowM = millis();
+    unsigned long dtMs = (lastLoopMs > 0) ? (nowM - lastLoopMs) : 10UL;
+    if (dtMs > 100UL) dtMs = 100UL;
+    lastLoopMs = nowM;
+
+    smoothL = smoothDecel(smoothL, leftSpeed,  dtMs);
+    smoothR = smoothDecel(smoothR, rightSpeed, dtMs);
+
+    int scaledL = scaleToMotor(smoothL);
+    int scaledR = scaleToMotor(smoothR);
     if (scaledL != sentL || scaledR != sentR || nowM - lastMotorMs >= 50) {
       sendMotorBytes(scaledL, scaledR);
       sentL = scaledL; sentR = scaledR; lastMotorMs = nowM;
@@ -438,7 +563,7 @@ void loop() {
   }
 
   // ── Publish Core 1 state to IO task ──────────────────────────────
-  publishCtrl2IO(leftSpeed, rightSpeed, piDriveActive);
+  publishCtrl2IO(smoothL, smoothR, piDriveActive);
 
   updateLED(relay_motor, relay_turbo);
 
