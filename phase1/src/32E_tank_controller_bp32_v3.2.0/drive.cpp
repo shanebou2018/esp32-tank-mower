@@ -72,6 +72,22 @@ void sendMotorBytes(int leftSpd, int rightSpd) {
   Serial2.write(rByte);
 }
 
+// ── Deceleration smoothing ───────────────────────────────────────────────────
+// Rate-limits motor output only when decelerating (moving toward zero) or
+// reversing direction.  Acceleration from zero is always instant so steering
+// stays responsive.
+int smoothDecel(int current, int target, unsigned long dt_ms) {
+  if (current == target) return current;
+  bool needsLimiting = (current > 0 && target < current) ||
+                       (current < 0 && target > current);
+  if (!needsLimiting) return target;
+  if (dt_ms > 100UL) dt_ms = 100UL;       // cap to prevent big jumps after pauses
+  int maxStep = max(1, (int)(DECEL_RATE * dt_ms / 1000));
+  int diff    = target - current;
+  if (abs(diff) <= maxStep) return target;
+  return current + (diff > 0 ? maxStep : -maxStep);
+}
+
 // ── Arm state machine ─────────────────────────────────────────────────────────
 
 void startArmSequence() {

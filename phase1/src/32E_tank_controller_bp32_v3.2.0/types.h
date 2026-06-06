@@ -15,6 +15,9 @@
 #include "rom/gpio.h"   // gpio_matrix_out() — ROM fn, no macro conflicts
 #include <esp_wifi.h>   // esp_wifi_stop()
 #include <esp_bt.h>     // esp_bredr_tx_power_set()
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include "wifi_config.h"
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 // Motor serial: GPIO 25 → MDDS30 IN1 (TX-only, Serial Simplified).
@@ -95,6 +98,20 @@
 #define MOTOR_R_DIR     (+1)
 
 #define PIPBOY_INTERVAL_MS 500
+
+// ── OTA update window ─────────────────────────────────────────────────────────
+#define OTA_HOSTNAME         "tank-mower"
+#define OTA_WINDOW_MS        60000UL  // WiFi stays up this long at boot for OTA
+
+// ── Speed categories (Circle button multi-click) ──────────────────────────────
+#define SPEED_CAT_LOW_PCT    40        // % of MAX_SPEED for Low
+#define SPEED_CAT_MED_PCT    70        // % of MAX_SPEED for Medium
+#define SPEED_HOLD_MS        1500UL   // Hold Circle this long to reset to Low
+#define SPEED_BTN_TIMEOUT_MS 3000UL   // Inactivity after last click finalises category
+
+// ── Deceleration smoothing ────────────────────────────────────────────────────
+#define DECEL_RATE           300      // Max speed-units/second when decelerating
+                                      // 100→0 in ~333ms; tune if too abrupt/slow
 
 // ── Pip-Boy scene engine ──────────────────────────────────────────────────────
 enum MowerScene {
@@ -198,6 +215,10 @@ extern int           dpadSpeed;
 extern unsigned long lastFlash;
 extern bool          flashState;
 
+extern bool          otaWindowActive;
+extern unsigned long otaWindowStart;
+extern int           speedCat;         // 1=Low, 2=Med, 3=Fast
+
 // ── Cross-file function declarations ─────────────────────────────────────────
 
 // debug.cpp
@@ -218,6 +239,7 @@ void   sendMotorBytes(int leftSpd, int rightSpd);
 void   startArmSequence();
 void   stopMotor();
 void   updateArmStateMachine();
+int    smoothDecel(int current, int target, unsigned long dt_ms);
 
 // bt_callbacks.cpp
 void onConnectedGamepad(GamepadPtr gp);
